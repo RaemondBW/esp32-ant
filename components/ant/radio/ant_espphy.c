@@ -451,6 +451,16 @@ static void IRAM_ATTR decode_rx_desc(ant_espphy_t *d)
                     t->matched = ok;
                     d->tap_head++;
                 }
+                /* Only while the MAC is listening. In coexist mode the windows
+                 * are open all the time, so a frame can land while the MAC has
+                 * its receiver off (between a tracked channel's slots, or after
+                 * a channel closed). Queuing it then leaves the ring non-empty
+                 * with nobody draining it, and the node task - which wakes on a
+                 * non-empty ring - spins at top priority until the next slot,
+                 * or forever after a close: a task watchdog reset on the bike
+                 * computer (2026-09-02). A receiver that is not listening does
+                 * not receive; drop it. */
+                if (ok && !d->rx_on) { d->rx_off_dropped++; ok = false; }
                 if (ok) {
                     d->rx_matched++;
                     uint32_t head = d->ring_head;
@@ -943,6 +953,8 @@ bool ant_espphy_tap_poll(ant_espphy_t *dev, ant_espphy_rx_t *out, bool *matched)
 bool ant_espphy_wait_rx(ant_espphy_t *dev, uint32_t timeout_ms)
 {
     dev->waiter = xTaskGetCurrentTaskHandle();
+    /* Never spin on frames the MAC is not going to read (see decode_rx_desc). */
+    if (!dev->rx_on) dev->ring_tail = dev->ring_head;
     if (dev->ring_head != dev->ring_tail) return true;
     ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(timeout_ms));
     return dev->ring_head != dev->ring_tail;

@@ -87,6 +87,9 @@ void loop() {
             else if (!strcmp(cmd, "adv")) { NimBLEAdvertising *a = NimBLEDevice::getAdvertising(); a->setName("ant-bench"); if (arg) { a->setMinInterval(atoi(arg)); a->setMaxInterval(atoi(arg)); } Serial.printf("adv start %d\n", a->start()); }
             else if (!strcmp(cmd, "keephdr")) ant.phy.keep_rx_hdr = arg && !strcmp(arg, "on");
             else if (!strcmp(cmd, "elt")) { const uint32_t *e = (const uint32_t *)ant.phy.scan_elt; Serial.printf("elt %p:", (void*)e); if (e) for (int i = 0; i < 32; i++) Serial.printf("%s%08lx", (i % 8) ? " " : "\n  ", (unsigned long)e[i]); Serial.println(); }
+            else if (!strcmp(cmd, "pwr")) { uint8_t r = ant_node_pair(&ant, 1, ANTPLUS_DEVTYPE_BIKE_POWER, ANTPLUS_PERIOD_BIKE_POWER); Serial.printf("power pair search on ch1: 0x%02x\n", r); }
+            else if (!strcmp(cmd, "cad")) { uint8_t r = ant_node_pair(&ant, 2, ANTPLUS_DEVTYPE_BIKE_SPDCAD, ANTPLUS_PERIOD_BIKE_SPDCAD); Serial.printf("spdcad pair search on ch2: 0x%02x\n", r); }
+            else if (!strcmp(cmd, "close")) { ant_node_close(&ant, 1); ant_node_close(&ant, 2); }
             else if (!strcmp(cmd, "advoff")) NimBLEDevice::getAdvertising()->stop();
             else if (!strcmp(cmd, "ble")) connectBle();
             status();

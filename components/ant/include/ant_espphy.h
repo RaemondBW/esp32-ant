@@ -177,6 +177,7 @@ typedef struct {
     uint32_t rx_frames;               /* packets carrying at least a whole body */
     uint32_t rx_matched;              /* ... whose address passed the MAC's mask */
     uint32_t rx_dropped;              /* ... lost because the ring was full */
+    uint32_t rx_off_dropped;          /* ... matched while the MAC was not listening */
     uint32_t sched_hook_calls;        /* test-event start hook (CS rewrites) */
     uint32_t sync_rewrites;           /* live sync-word changes (acquire / lose) */
     uint32_t hci_errors;
