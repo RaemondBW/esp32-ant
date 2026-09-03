@@ -100,12 +100,17 @@ Magene strap, device 26945):
 - **Start the ANT node before the BLE scan.** The controller calls the scan's
   window-start callback through a pointer captured when the scan is created;
   the window hooks are only installed once `ant_node_start()` has run.
-- A 1 ms window still yields ~3.4 pages/s from a 4 Hz sensor (an ANT frame
-  is ~150 us on the air). Longer windows raise the odds of the remaining
-  problem: a higher-priority event (advertising, a connection event) that
-  starts while a window is open still resets the device. See the comment on
-  `coexist_win_len_us()` in `ant_espphy.c`; `examples/bench_antonly/`
-  reproduces all of this on a bare devkit with console knobs.
+- The abort is requested the moment a window starts. A pending abort does
+  not end the window by itself: it runs on until the core's own end (~27 ms),
+  a received packet, or the next scheduled activity, and packets keep
+  arriving meanwhile. What it changes is what happens when advertising (or
+  a connection event) arrives: with the abort pending the window ends
+  normally 0.7 ms later; without it the LL stalls in its ISR. A trace ring
+  in RTC memory (`ant_espphy_dump_trace()`) settled this. Five minutes of
+  default-interval advertising next to a tracked strap ran clean at ~3
+  pages/s; CRC checking stays on (the test format delivers frames anyway).
+  `examples/bench_antonly/` reproduces all of this on a bare devkit with
+  console knobs.
 
 `ant_node_stop()` waits for the ANT task to exit (≤ 500 ms), so call it from
 a normal task, not from the ANT callbacks.

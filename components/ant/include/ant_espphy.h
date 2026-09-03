@@ -125,6 +125,8 @@ typedef struct {
                                          the scan's own MINEVTIME each window) */
     uint16_t win_minevt;              /* MINEVTIME read from the scan CS at window start */
     uint32_t win_len_us;              /* length in use for the current window */
+    void    *scan_elt;                /* the scheduler element handed to the scan's
+                                         window-start callback (bring-up: dump it) */
     uint32_t win_ll_ended;            /* windows the LL ended before our abort */
     uint32_t win_ll_min_us;           /* ... the shortest such window (0 = none yet) */
     volatile uint32_t win_start_us;   /* esp_timer time of the current window's start */
@@ -226,6 +228,11 @@ uint32_t ant_espphy_ticks(void);
  * frame, whichever is first. Returns true if a frame is waiting. Lets the ANT
  * task sleep instead of polling rx_poll() every few hundred microseconds. */
 bool ant_espphy_wait_rx(ant_espphy_t *dev, uint32_t timeout_ms);
+
+/* Bring-up: print the radio-event trace ring the previous run left in RTC
+ * memory (window starts, aborts, end-of-frame, advertising/connection event
+ * starts), then clear it. Call early at boot. */
+void ant_espphy_dump_trace(void);
 
 /* Debug: copy the first n-1 bytes of the radio control structure and, as the
  * last byte, the frequency-table entry the receiver uses. */

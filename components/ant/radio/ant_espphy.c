@@ -93,6 +93,28 @@ extern void  *r_emi_get_mem_addr_by_offset(uint16_t offset);
 #define IPF_LLD_SCAN_FRM_EOF_ISR    253   /* void (act_id, timestamp, abort) (_eco) */
 #define IPF_LLD_SCAN_FRM_SKIP_ISR   255   /* void (act_id) (_eco) */
 #define IPF_LLD_SCAN_FRM_RX_ISR     254   /* void (act_id) - a packet landed in a window */
+/* Tracers only (pass-through hooks that time-stamp the trace ring). */
+#define IPF_LLD_ADV_END             104
+#define IPF_LLD_ADV_EVT_START       106
+#define IPF_LLD_CON_EVT_START       210
+
+/* Trace ring in RTC memory: survives the interrupt-watchdog reset, so the
+ * sequence of radio events right before a hang can be read on the next boot
+ * (ant_espphy_dump_trace). */
+#include "esp_attr.h"
+#define TRACE_N 96
+typedef struct { uint32_t t; uint8_t type; uint8_t a; uint16_t b; } trace_ent_t;
+RTC_NOINIT_ATTR static struct { uint32_t magic; uint32_t head; trace_ent_t e[TRACE_N]; } s_trace;
+#define TRACE_MAGIC 0xA7A7C0DEu
+enum { TR_WIN_START = 1, TR_ABORT, TR_EOF, TR_CANCEL, TR_SKIP, TR_SCHED, TR_ADV_START, TR_ADV_END,
+       TR_CON_START, TR_RX, TR_DEINIT };
+static inline void IRAM_ATTR trace(uint8_t type, uint8_t a, uint16_t b)
+{
+    if (s_trace.magic != TRACE_MAGIC) return;
+    trace_ent_t *e = &s_trace.e[s_trace.head % TRACE_N];
+    e->t = (uint32_t)esp_timer_get_time(); e->type = type; e->a = a; e->b = b;
+    s_trace.head++;
+}
 
 #define EM_FREQ_TABLE   0x100u   /* byte[ch] = MHz - 2402 */
 #define EM_CS           0x400u   /* control structure 0: the test event's */
@@ -474,6 +496,7 @@ static uint32_t IRAM_ATTR hook_test_rx_isr(uint32_t timestamp)
 static uint32_t IRAM_ATTR hook_scan_sched(uint32_t scan_id, uint32_t ts, uint32_t resched)
 {
     coexist_abort(s_dev, 1);
+    trace(TR_SCHED, (uint8_t)resched, (uint16_t)ts);
     uint32_t r = s_orig_scan_sched(scan_id, ts, resched);
     ant_espphy_t *d = s_dev;
     if (d && d->coexist && d->mode == ANT_ESPPHY_MODE_RX) {
@@ -554,6 +577,7 @@ static void coexist_win_timer_cb(void *arg)
     uint32_t age = (uint32_t)esp_timer_get_time() - d->win_start_us;
     if (age < d->win_len_us) return;
     d->win_active = false;
+    trace(TR_ABORT, 0, (uint16_t)age);
     /* SCAN_ABORT, not RFTEST_ABORT: the latter ends the event too, but the
      * LL's end-of-event handling for the scan slot then spins in its ISR
      * (interrupt watchdog). The scan abort is the path the LL expects. */
@@ -580,6 +604,7 @@ static uint32_t IRAM_ATTR hook_scan_evt_start(uint32_t evt)
 {
     uint32_t r = s_orig_scan_evt_start(evt);
     ant_espphy_t *d = s_dev;
+    if (d) d->scan_elt = (void *)evt;
     if (d && d->coexist && d->mode == ANT_ESPPHY_MODE_RX) {
         coexist_find_cs(d);
         if (d->cs_off) {
@@ -604,17 +629,36 @@ static uint32_t IRAM_ATTR hook_scan_evt_start(uint32_t evt)
             d->win_len_us = coexist_win_len_us(d, d->win_minevt);
             d->win_start_us = (uint32_t)esp_timer_get_time();
             d->win_active = true;
+            trace(TR_WIN_START, 0, d->win_minevt);
+            /* Arm the abort NOW rather than from the timer. The trace of
+             * 2026-09-02 showed the window survives an abort request until
+             * the core's own end (~27 ms), a received packet, or the next
+             * activity - and it is only when the next activity (advertising)
+             * arrives with NO abort pending that the LL stalls. An abort
+             * that is already pending turns that arrival into a normal end
+             * of event 0.7 ms later. Packets still arrive after the pulse. */
+            if (!(d->abort_mode & 0x40)) {
+                RWBLECNTL |= RWBLECNTL_SCAN_ABORT;
+                d->aborts++;
+                trace(TR_ABORT, 1, 0);
+            }
             d->win_hook_calls++;
         }
     }
     return r;
 }
 
+static fn_u32_t s_orig_adv_end, s_orig_adv_start, s_orig_con_start;
+static uint32_t IRAM_ATTR hook_adv_start(uint32_t evt) { trace(TR_ADV_START, 0, 0); return s_orig_adv_start(evt); }
+static uint32_t IRAM_ATTR hook_adv_end(uint32_t a, uint32_t b, uint32_t c) { trace(TR_ADV_END, (uint8_t)b, (uint16_t)c); return ((uint32_t (*)(uint32_t,uint32_t,uint32_t))s_orig_adv_end)(a, b, c); }
+static uint32_t IRAM_ATTR hook_con_start(uint32_t evt) { trace(TR_CON_START, 0, 0); return s_orig_con_start(evt); }
+
 static fn_u32_t s_orig_scan_frm_rx;
 static uint32_t IRAM_ATTR hook_scan_frm_rx(uint32_t act_id)
 {
     ant_espphy_t *d = s_dev;
     if (d && d->coexist) {
+        trace(TR_RX, 0, 0);
         d->scan_rx_isr_calls++;
         em_rx_desc_t *desc = (em_rx_desc_t *)em_ptr(EM_RX_DESC);
         uint8_t idx = ((uint8_t *)p_lld_env)[LLD_ENV_RX_FIFO_IDX];
@@ -626,6 +670,7 @@ static uint32_t IRAM_ATTR hook_scan_frm_rx(uint32_t act_id)
 
 static uint32_t IRAM_ATTR hook_scan_frm_eof(uint32_t act_id, uint32_t ts, uint32_t abort)
 {
+    trace(TR_EOF, (uint8_t)abort, (uint16_t)ts);
     coexist_abort(s_dev, 2);
     coexist_window_end(s_dev);
     return s_orig_scan_frm_eof(act_id, ts, abort);
@@ -633,6 +678,7 @@ static uint32_t IRAM_ATTR hook_scan_frm_eof(uint32_t act_id, uint32_t ts, uint32
 
 static uint32_t IRAM_ATTR hook_scan_evt_canceled(uint32_t evt)
 {
+    trace(TR_CANCEL, 0, 0);
     coexist_abort(s_dev, 4);
     coexist_window_end(s_dev);
     return s_orig_scan_evt_canceled(evt);
@@ -640,8 +686,26 @@ static uint32_t IRAM_ATTR hook_scan_evt_canceled(uint32_t evt)
 
 static uint32_t IRAM_ATTR hook_scan_frm_skip(uint32_t act_id)
 {
+    trace(TR_SKIP, 0, 0);
     coexist_window_end(s_dev);
     return s_orig_scan_frm_skip(act_id);
+}
+
+void ant_espphy_dump_trace(void)
+{
+    static const char *names[] = { "?", "WIN", "ABORT", "EOF", "CANCEL", "SKIP", "SCHED", "ADV", "ADVEND", "CON", "RX", "DEINIT" };
+    if (s_trace.magic != TRACE_MAGIC) { printf("[trace] empty\n"); s_trace.magic = TRACE_MAGIC; s_trace.head = 0; return; }
+    uint32_t n = s_trace.head < TRACE_N ? s_trace.head : TRACE_N;
+    uint32_t start = s_trace.head - n;
+    printf("[trace] last %lu events before reset (us, delta, type, a, b):\n", (unsigned long)n);
+    uint32_t prev = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        const trace_ent_t *e = &s_trace.e[(start + i) % TRACE_N];
+        printf("  %10lu %+7ld %-6s %3u %5u\n", (unsigned long)e->t, (long)(prev ? e->t - prev : 0),
+               e->type < 12 ? names[e->type] : "?", e->a, e->b);
+        prev = e->t;
+    }
+    s_trace.head = 0;
 }
 
 void ant_espphy_debug_cs(ant_espphy_t *d, uint8_t *out, size_t n)
@@ -675,6 +739,13 @@ static void install_scan_hooks(void)
     r_ip_funcs_p[IPF_LLD_SCAN_EVT_CANCELED]   = (void *)hook_scan_evt_canceled;
     r_ip_funcs_p[IPF_LLD_SCAN_FRM_SKIP_ISR]   = (void *)hook_scan_frm_skip;
     r_ip_funcs_p[IPF_LLD_SCAN_FRM_EOF_ISR]    = (void *)hook_scan_frm_eof;
+    s_orig_adv_start = (fn_u32_t)r_ip_funcs_p[IPF_LLD_ADV_EVT_START];
+    s_orig_adv_end   = (fn_u32_t)r_ip_funcs_p[IPF_LLD_ADV_END];
+    s_orig_con_start = (fn_u32_t)r_ip_funcs_p[IPF_LLD_CON_EVT_START];
+    r_ip_funcs_p[IPF_LLD_ADV_EVT_START] = (void *)hook_adv_start;
+    r_ip_funcs_p[IPF_LLD_ADV_END]       = (void *)hook_adv_end;
+    r_ip_funcs_p[IPF_LLD_CON_EVT_START] = (void *)hook_con_start;
+    if (s_trace.magic != TRACE_MAGIC) { s_trace.magic = TRACE_MAGIC; s_trace.head = 0; }
 }
 
 /* ---------------------------------- HCI ----------------------------------- */
@@ -944,6 +1015,10 @@ static void restore_scan_hooks(void)
     if (s_orig_scan_frm_skip)     r_ip_funcs_p[IPF_LLD_SCAN_FRM_SKIP_ISR] = (void *)s_orig_scan_frm_skip;
     if (s_orig_scan_frm_eof)      r_ip_funcs_p[IPF_LLD_SCAN_FRM_EOF_ISR]  = (void *)s_orig_scan_frm_eof;
     if (s_orig_scan_frm_rx)       r_ip_funcs_p[IPF_LLD_SCAN_FRM_RX_ISR]   = (void *)s_orig_scan_frm_rx;
+    if (s_orig_adv_start) r_ip_funcs_p[IPF_LLD_ADV_EVT_START] = (void *)s_orig_adv_start;
+    if (s_orig_adv_end)   r_ip_funcs_p[IPF_LLD_ADV_END]       = (void *)s_orig_adv_end;
+    if (s_orig_con_start) r_ip_funcs_p[IPF_LLD_CON_EVT_START] = (void *)s_orig_con_start;
+    trace(TR_DEINIT, 0, 0);
     RWBLECNTL &= ~RWBLECNTL_CRC_OFF;
 }
 
@@ -1034,6 +1109,7 @@ ant_espphy_status_t ant_espphy_init_coexist(ant_espphy_t *dev)
     memset(dev, 0, sizeof(*dev));
     espphy_setup_phy(dev);
     dev->coexist = true;
+    dev->win_keep_crc = true;   /* the test format delivers CRC failures anyway */
     dev->bt_up   = false;                           /* the host owns the controller */
 
     /* The three scan entries must be ROM functions, as everywhere else this

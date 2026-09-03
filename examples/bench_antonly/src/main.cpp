@@ -45,6 +45,7 @@ static void connectBle() {
 
 void setup() {
     Serial.begin(115200); delay(1500);
+    ant_espphy_dump_trace();
     NimBLEDevice::init("ant-bench");
     ant_node_config_t cfg = {}; cfg.on_data = on_ant_data; cfg.store = &ant_node_store_ram; cfg.coexist = true;
     ant_espphy_status_t s = ant_node_start(&ant, &cfg);
@@ -85,6 +86,7 @@ void loop() {
             else if (!strcmp(cmd, "scan")) { scanSlots = arg ? atoi(arg) : 16; NimBLEDevice::getScan()->stop(); startScan(); }
             else if (!strcmp(cmd, "adv")) { NimBLEAdvertising *a = NimBLEDevice::getAdvertising(); a->setName("ant-bench"); if (arg) { a->setMinInterval(atoi(arg)); a->setMaxInterval(atoi(arg)); } Serial.printf("adv start %d\n", a->start()); }
             else if (!strcmp(cmd, "keephdr")) ant.phy.keep_rx_hdr = arg && !strcmp(arg, "on");
+            else if (!strcmp(cmd, "elt")) { const uint32_t *e = (const uint32_t *)ant.phy.scan_elt; Serial.printf("elt %p:", (void*)e); if (e) for (int i = 0; i < 32; i++) Serial.printf("%s%08lx", (i % 8) ? " " : "\n  ", (unsigned long)e[i]); Serial.println(); }
             else if (!strcmp(cmd, "advoff")) NimBLEDevice::getAdvertising()->stop();
             else if (!strcmp(cmd, "ble")) connectBle();
             status();
