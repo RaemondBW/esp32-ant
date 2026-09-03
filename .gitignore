@@ -1,0 +1,12 @@
+build/
+sdkconfig
+sdkconfig.old
+test/host/ant_tests
+*.o
+.cache/
+.pio/
+*.cs8
+*.cf32
+__pycache__/
+.DS_Store
+*.dSYM/

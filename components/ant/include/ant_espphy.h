@@ -1,0 +1,164 @@
+/*
+ * ant_espphy.h - ANT on the ESP32's own 2.4 GHz radio (the pure-ESP32 PHY).
+ *
+ * Implements ant_phy_t on the BLE controller of an ESP32-S3 / ESP32-C3 with no
+ * external chip. The trick (from ESPwn32 / esperanto, Cayre et al., WOOT 2023)
+ * is that the RW-BLE link-layer core is a generic GFSK modem whose per-event
+ * control structure (CS) lives in a RAM the CPU can write, and whose
+ * link-layer functions are called through a writable table (r_ip_funcs_p).
+ * We run the controller's own LE test mode (DTM, "channel 39") and hook two
+ * of its functions: after the controller has programmed the test event we
+ * rewrite the CS so the modem runs at 1 Mbit/s on 2457 MHz with the ANT sync
+ * word and CRC/whitening off, and in the RX interrupt we lift the raw bytes
+ * out of the RX descriptor. That is exactly ANT's ShockBurst air format, so
+ * the ANT MAC (ant_mac) runs unchanged on top.
+ *
+ *   RX  : HCI LE receiver test. The event never ends, the evt_start hook
+ *         reprograms the CS, the rx_isr hook hands every packet that matched
+ *         the sync word to a lock-free ring for rx_poll(). Test mode runs with
+ *         whitening off, so the bytes only need bit-reversal. The sync word is
+ *         chosen from the MAC's address match: a known device number gives
+ *         `a6 c5 dev_hi dev_lo`, a wildcard search gives `aa aa a6 c5`
+ *         (preamble + network marker), and the rest of the address is matched
+ *         in software - which is what lets several slave channels share the
+ *         one receiver. Wildcard caveat: the core reads the byte after the
+ *         sync word as a length, so ~5% of device numbers (those whose low
+ *         byte bit-reverses to < 13) cannot be found by wildcard search;
+ *         give the device number explicitly for those.
+ *   TX  : HCI LE transmitter test; tx() drops the frame into the DTM payload
+ *         buffer, so the next test packet carries it, and clears it again a
+ *         few ms later. DTM transmits back-to-back, so the frame goes out a
+ *         few times per slot; receivers ignore the repeats.
+ *
+ * The controller runs one test event at a time and switching takes
+ * milliseconds of HCI traffic, so the backend is "sticky": rx_enable(true)
+ * puts it in RX mode (a slave/display), the first tx() puts it in TX mode (a
+ * master/sensor). Once in a mode the other direction is refused and counted.
+ * A bidirectional master therefore transmits but never hears replies; the ANT
+ * MAC copes (broadcasts do not need one).
+ *
+ * The controller is used bare (no BLE host, our own VHCI callback), so a BLE
+ * host cannot be up at the same time: init() refuses unless the controller is
+ * idle, deinit() shuts it down again for the host.
+ *
+ * Supported: ESP32-S3, ESP32-C3 (same controller; the function-table indices
+ * are identical on ESP-IDF 4.4 and 5.x, so the Arduino core works too).
+ * ESP32-C6 (a different controller) returns ANT_ESPPHY_ERR_UNSUPPORTED from
+ * init for now.
+ */
+#ifndef ANT_ESPPHY_H
+#define ANT_ESPPHY_H
+
+#include "ant_phy.h"
+#include "ant_phy_shockburst.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef enum {
+    ANT_ESPPHY_OK = 0,
+    ANT_ESPPHY_ERR_UNSUPPORTED,   /* this chip's controller is not supported yet */
+    ANT_ESPPHY_ERR_BT,            /* BT controller init/enable or HCI failed */
+    ANT_ESPPHY_ERR_ARG,
+} ant_espphy_status_t;
+
+typedef enum {
+    ANT_ESPPHY_MODE_IDLE = 0,     /* controller up, no radio event running */
+    ANT_ESPPHY_MODE_RX,           /* LE receiver test: raw ANT receive */
+    ANT_ESPPHY_MODE_TX,           /* DTM: raw ANT transmit */
+} ant_espphy_mode_t;
+
+/* One received frame, as parked by the RX interrupt hook. */
+#define ANT_ESPPHY_RX_RING  8u
+typedef struct {
+    uint8_t  body[ANT_SB_FRAME_MAX];  /* address|payload|crc, preamble stripped */
+    uint8_t  len;
+    int8_t   rssi;
+    bool     matched;                 /* address passed the MAC's mask (tap only) */
+    uint32_t tick;
+} ant_espphy_rx_t;
+
+#define ANT_ESPPHY_TAP_RING 16
+
+typedef struct {
+    ant_phy_t phy;                    /* must be first */
+    volatile ant_espphy_mode_t mode;
+    bool     bt_up;
+    uint16_t mhz;
+
+    /* receiver programming */
+    ant_phy_rx_cfg_t rx_cfg;
+    uint8_t  sync[4];                 /* wanted: on-air order, first byte first */
+    uint8_t  sync_skip;               /* sync bytes that are NOT part of the body (2 for aa aa) */
+    uint8_t  cs_sync[4];              /* what the control structure currently holds */
+    uint8_t  cs_sync_skip;
+    bool     rx_on;
+    void    *waiter;                  /* task to notify when a frame is queued */
+
+    /* ISR -> task ring (single producer, single consumer) */
+    ant_espphy_rx_t ring[ANT_ESPPHY_RX_RING];
+    volatile uint32_t ring_head, ring_tail;
+
+    /* Diagnostic tap: every packet the hook decodes, matched or not, when
+     * `tap_on` is set. Drain with ant_espphy_tap_poll() from a task. */
+    bool tap_on;
+    ant_espphy_rx_t tap[ANT_ESPPHY_TAP_RING];
+    volatile uint32_t tap_head, tap_tail;
+
+    /* counters (read by the app log; written from hooks, plain stores) */
+    uint32_t tx_count;                /* frames handed to tx() */
+    uint32_t tx_emitted;              /* ... written into the DTM buffer */
+    uint32_t tx_refused;              /* ... refused because we are in RX mode */
+    uint32_t rx_enables_ignored;      /* rx_enable(true) while in TX mode */
+    uint32_t tunes;
+    uint32_t rx_polls;
+    uint32_t rx_hook_calls;           /* RX interrupt entries with a packet */
+    uint32_t rx_hook_empty;           /* ... entries with an empty header */
+    uint32_t rx_frames;               /* packets carrying at least a whole body */
+    uint32_t rx_matched;              /* ... whose address passed the MAC's mask */
+    uint32_t rx_dropped;              /* ... lost because the ring was full */
+    uint32_t sched_hook_calls;        /* test-event start hook (CS rewrites) */
+    uint32_t sync_rewrites;           /* live sync-word changes (acquire / lose) */
+    uint32_t hci_errors;
+    int8_t   last_rssi;
+    uint8_t  last_frame[ANT_SB_FRAME_MAX]; /* last body sent or received */
+    uint8_t  last_len;
+} ant_espphy_t;
+
+/* Bring up the BT controller, install the hooks, leave the radio idle. Only
+ * one instance can exist (the hooks are global). */
+ant_espphy_status_t ant_espphy_init(ant_espphy_t *dev);
+
+/* Diagnostics: with dev->tap_on set, every packet the RX hook decodes (address
+ * matched or not) is copied into a side ring; this pops the oldest one. The
+ * body is {address | payload | crc}; `matched` tells whether it also went to
+ * the MAC. Returns false when the ring is empty. */
+bool ant_espphy_tap_poll(ant_espphy_t *dev, ant_espphy_rx_t *out, bool *matched);
+
+/* Stop the radio event, unhook the controller and shut it down, so a BLE host
+ * (NimBLE, Bluedroid) can take the controller again. The ANT MAC must not be
+ * ticked after this. */
+void ant_espphy_deinit(ant_espphy_t *dev);
+const char *ant_espphy_status_str(ant_espphy_status_t s);
+const char *ant_espphy_mode_str(ant_espphy_mode_t m);
+
+/* The ant_phy_t to hand to ant_radio_embedded_init(). */
+ant_phy_t *ant_espphy_phy(ant_espphy_t *dev);
+
+/* ANT ticks (1/32768 s) from the high-resolution timer, for ant_mac_tick(). */
+uint32_t ant_espphy_ticks(void);
+
+/* Block the calling task up to `timeout_ms` or until the receiver queues a
+ * frame, whichever is first. Returns true if a frame is waiting. Lets the ANT
+ * task sleep instead of polling rx_poll() every few hundred microseconds. */
+bool ant_espphy_wait_rx(ant_espphy_t *dev, uint32_t timeout_ms);
+
+/* Debug: copy the first n-1 bytes of the radio control structure and, as the
+ * last byte, the frequency-table entry the receiver uses. */
+void ant_espphy_debug_cs(ant_espphy_t *dev, uint8_t *out, size_t n);
+
+#ifdef __cplusplus
+}
+#endif
+#endif /* ANT_ESPPHY_H */
