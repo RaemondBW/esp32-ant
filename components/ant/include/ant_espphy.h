@@ -131,6 +131,7 @@ typedef struct {
     uint32_t win_ll_min_us;           /* ... the shortest such window (0 = none yet) */
     volatile uint32_t win_start_us;   /* esp_timer time of the current window's start */
     volatile bool     win_active;
+    volatile bool     win_abort_sent; /* this window's abort pulse has been issued */
     void    *win_timer;               /* periodic esp_timer driving the abort */
     uint16_t mhz_override;            /* knob: window frequency instead of the MAC's (0 = off) */
     uint8_t  sync_override[4];        /* knob: on-air sync bytes to program instead of
@@ -234,6 +235,11 @@ bool ant_espphy_wait_rx(ant_espphy_t *dev, uint32_t timeout_ms);
  * memory (window starts, aborts, end-of-frame, advertising/connection event
  * starts), then clear it. Call early at boot. */
 void ant_espphy_dump_trace(void);
+/* The same ring, entry by entry, for an app that logs somewhere other than
+ * stdout (a card, a diag ring). trace_reset() clears it. */
+size_t ant_espphy_trace_count(void);
+bool   ant_espphy_trace_get(size_t i, uint32_t *t_us, const char **type, uint8_t *a, uint16_t *b);
+void   ant_espphy_trace_reset(void);
 
 /* Debug: copy the first n-1 bytes of the radio control structure and, as the
  * last byte, the frequency-table entry the receiver uses. */

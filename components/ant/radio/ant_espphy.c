@@ -107,9 +107,14 @@ typedef struct { uint32_t t; uint8_t type; uint8_t a; uint16_t b; } trace_ent_t;
 RTC_NOINIT_ATTR static struct { uint32_t magic; uint32_t head; trace_ent_t e[TRACE_N]; } s_trace;
 #define TRACE_MAGIC 0xA7A7C0DEu
 enum { TR_WIN_START = 1, TR_ABORT, TR_EOF, TR_CANCEL, TR_SKIP, TR_SCHED, TR_ADV_START, TR_ADV_END,
-       TR_CON_START, TR_RX, TR_DEINIT };
+       TR_CON_START, TR_RX, TR_DEINIT, TR_CFG, TR_RXEN, TR_TUNE };
 static inline void IRAM_ATTR trace(uint8_t type, uint8_t a, uint16_t b)
 {
+#ifndef ANT_ESPPHY_TRACE
+    /* Compiled out unless asked for: it writes RTC memory from the BT
+     * controller's interrupt, which is a bring-up aid, not a shipping path. */
+    (void)type; (void)a; (void)b; return;
+#endif
     if (s_trace.magic != TRACE_MAGIC) return;
     trace_ent_t *e = &s_trace.e[s_trace.head % TRACE_N];
     e->t = (uint32_t)esp_timer_get_time(); e->type = type; e->a = a; e->b = b;
@@ -555,6 +560,13 @@ static inline void IRAM_ATTR coexist_abort(ant_espphy_t *d, uint8_t where)
  * higher-priority activity (advertising) turns up, so it is re-read on every
  * timer tick, not just at window start: a deadline taken at start went stale
  * and the late abort collided with the advertiser (interrupt watchdog). */
+/* The abort pulse goes out on the first timer tick at least this long after
+ * the window-start callback, i.e. once the core is certainly running the
+ * event (see hook_scan_evt_start). With a 500 us tick that is 0.3-0.8 ms in,
+ * ahead of the earliest next activity the scheduler books (MINEVTIME 3 =
+ * 0.9 ms was the smallest seen). A pending abort does not shorten a quiet
+ * window: it ends at the core's ~27 ms limit, the first received packet, or
+ * the next activity. */
 #define ANT_ESPPHY_WIN_US 1000u
 static uint32_t coexist_win_len_us(const ant_espphy_t *d, uint16_t minevt)
 {
@@ -579,6 +591,7 @@ static void coexist_win_timer_cb(void *arg)
 {
     ant_espphy_t *d = (ant_espphy_t *)arg;
     if (!d->coexist || !d->win_active || d->mode != ANT_ESPPHY_MODE_RX) return;
+    if (d->win_abort_sent) return;           /* one pulse per window */
     if (d->cs_off) {
         const uint8_t *cs = em_ptr(d->cs_off);
         uint16_t me = (uint16_t)(cs[CS_MINEVTIME] | (cs[CS_MINEVTIME + 1] << 8));
@@ -586,7 +599,7 @@ static void coexist_win_timer_cb(void *arg)
     }
     uint32_t age = (uint32_t)esp_timer_get_time() - d->win_start_us;
     if (age < d->win_len_us) return;
-    d->win_active = false;
+    d->win_abort_sent = true;
     trace(TR_ABORT, 0, (uint16_t)age);
     /* SCAN_ABORT, not RFTEST_ABORT: the latter ends the event too, but the
      * LL's end-of-event handling for the scan slot then spins in its ISR
@@ -647,6 +660,26 @@ static uint32_t IRAM_ATTR hook_scan_evt_start(uint32_t evt)
              * arrives with NO abort pending that the LL stalls. An abort
              * that is already pending turns that arrival into a normal end
              * of event 0.7 ms later. Packets still arrive after the pulse. */
+            /* ...but only when the scheduler has squeezed this window (a
+             * small MINEVTIME means another activity is due within ~2 ms,
+             * sooner than the 1 ms timer can be trusted to fire). A pulse
+             * issued here for every window - before the hardware has started
+             * the event - coincided with interrupt-watchdog resets on a
+             * device holding a live connection, which the devkit does not
+             * have: the pulse can land while the previous connection event
+             * is still on the air. Quiet windows get theirs from the timer. */
+            /* NOT here. A pulse issued from this callback - before the core
+             * has started the event - is discarded at event start, so the
+             * window then runs with no abort pending; the trace of
+             * 2026-09-02 23:01 shows such a window (MINEVTIME 7) receiving a
+             * packet 18 ms in with no end of frame after it, then the stall.
+             * The timer issues the pulse once the event is running. */
+            /* The configuration that ran multi-minute soaks next to a live
+             * phone connection (commit 77a57f2 + the ring fix): request the
+             * abort here AND again from the timer ~1 ms in. Every variation
+             * tried since (hook only, timer only, earlier timer) coincided
+             * with resets within seconds of a strap reconnect. */
+            d->win_abort_sent = false;
             if (!(d->abort_mode & 0x40)) {
                 RWBLECNTL |= RWBLECNTL_SCAN_ABORT;
                 d->aborts++;
@@ -701,9 +734,31 @@ static uint32_t IRAM_ATTR hook_scan_frm_skip(uint32_t act_id)
     return s_orig_scan_frm_skip(act_id);
 }
 
+size_t ant_espphy_trace_count(void)
+{
+    if (s_trace.magic != TRACE_MAGIC) return 0;
+    return s_trace.head < TRACE_N ? s_trace.head : TRACE_N;
+}
+
+bool ant_espphy_trace_get(size_t i, uint32_t *t, const char **type, uint8_t *a, uint16_t *b)
+{
+    static const char *names[] = { "?", "WIN", "ABORT", "EOF", "CANCEL", "SKIP", "SCHED", "ADV", "ADVEND", "CON", "RX", "DEINIT", "CFG", "RXEN", "TUNE" };
+    size_t n = ant_espphy_trace_count();
+    if (i >= n) return false;
+    const trace_ent_t *e = &s_trace.e[(s_trace.head - n + i) % TRACE_N];
+    *t = e->t; *type = e->type < 15 ? names[e->type] : "?"; *a = e->a; *b = e->b;
+    return true;
+}
+
+void ant_espphy_trace_reset(void)
+{
+    s_trace.magic = TRACE_MAGIC;
+    s_trace.head = 0;
+}
+
 void ant_espphy_dump_trace(void)
 {
-    static const char *names[] = { "?", "WIN", "ABORT", "EOF", "CANCEL", "SKIP", "SCHED", "ADV", "ADVEND", "CON", "RX", "DEINIT" };
+    static const char *names[] = { "?", "WIN", "ABORT", "EOF", "CANCEL", "SKIP", "SCHED", "ADV", "ADVEND", "CON", "RX", "DEINIT", "CFG", "RXEN", "TUNE" };
     if (s_trace.magic != TRACE_MAGIC) { printf("[trace] empty\n"); s_trace.magic = TRACE_MAGIC; s_trace.head = 0; return; }
     uint32_t n = s_trace.head < TRACE_N ? s_trace.head : TRACE_N;
     uint32_t start = s_trace.head - n;
@@ -712,7 +767,7 @@ void ant_espphy_dump_trace(void)
     for (uint32_t i = 0; i < n; i++) {
         const trace_ent_t *e = &s_trace.e[(start + i) % TRACE_N];
         printf("  %10lu %+7ld %-6s %3u %5u\n", (unsigned long)e->t, (long)(prev ? e->t - prev : 0),
-               e->type < 12 ? names[e->type] : "?", e->a, e->b);
+               e->type < 15 ? names[e->type] : "?", e->a, e->b);
         prev = e->t;
     }
     s_trace.head = 0;
@@ -749,12 +804,18 @@ static void install_scan_hooks(void)
     r_ip_funcs_p[IPF_LLD_SCAN_EVT_CANCELED]   = (void *)hook_scan_evt_canceled;
     r_ip_funcs_p[IPF_LLD_SCAN_FRM_SKIP_ISR]   = (void *)hook_scan_frm_skip;
     r_ip_funcs_p[IPF_LLD_SCAN_FRM_EOF_ISR]    = (void *)hook_scan_frm_eof;
+    /* Tracer hooks on the advertiser / connection paths: bring-up only,
+     * and only when asked for (ANT_ESPPHY_TRACE_OTHERS) - patching the
+     * table entries other activities call through is one more thing that
+     * can go wrong on a device holding a live connection. */
+#ifdef ANT_ESPPHY_TRACE_OTHERS
     s_orig_adv_start = (fn_u32_t)r_ip_funcs_p[IPF_LLD_ADV_EVT_START];
     s_orig_adv_end   = (fn_u32_t)r_ip_funcs_p[IPF_LLD_ADV_END];
     s_orig_con_start = (fn_u32_t)r_ip_funcs_p[IPF_LLD_CON_EVT_START];
     r_ip_funcs_p[IPF_LLD_ADV_EVT_START] = (void *)hook_adv_start;
     r_ip_funcs_p[IPF_LLD_ADV_END]       = (void *)hook_adv_end;
     r_ip_funcs_p[IPF_LLD_CON_EVT_START] = (void *)hook_con_start;
+#endif
     if (s_trace.magic != TRACE_MAGIC) { s_trace.magic = TRACE_MAGIC; s_trace.head = 0; }
 }
 
@@ -922,6 +983,7 @@ static void espphy_rx_config(ant_phy_t *p, const ant_phy_rx_cfg_t *cfg)
     if (memcmp(d->sync, sync, 4) == 0 && d->sync_skip == skip) return;
     memcpy(d->sync, sync, 4);
     d->sync_skip = skip;
+    trace(TR_CFG, skip, (uint16_t)((sync[2] << 8) | sync[3]));
     /* Coexist mode reprograms the CS at every scan window, so a new sync word
      * takes effect on its own; nothing to restart. */
     if (d->coexist) return;
@@ -963,6 +1025,7 @@ bool ant_espphy_wait_rx(ant_espphy_t *dev, uint32_t timeout_ms)
 static void espphy_rx_enable(ant_phy_t *p, bool on)
 {
     ant_espphy_t *d = (ant_espphy_t *)p;
+    if (d->rx_on != on) trace(TR_RXEN, on, 0);
     d->rx_on = on;
     if (d->coexist) {
         /* No HCI: the scan windows the BLE host runs are the radio. Once armed

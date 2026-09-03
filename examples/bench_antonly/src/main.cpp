@@ -90,6 +90,9 @@ void loop() {
             else if (!strcmp(cmd, "pwr")) { uint8_t r = ant_node_pair(&ant, 1, ANTPLUS_DEVTYPE_BIKE_POWER, ANTPLUS_PERIOD_BIKE_POWER); Serial.printf("power pair search on ch1: 0x%02x\n", r); }
             else if (!strcmp(cmd, "cad")) { uint8_t r = ant_node_pair(&ant, 2, ANTPLUS_DEVTYPE_BIKE_SPDCAD, ANTPLUS_PERIOD_BIKE_SPDCAD); Serial.printf("spdcad pair search on ch2: 0x%02x\n", r); }
             else if (!strcmp(cmd, "close")) { ant_node_close(&ant, 1); ant_node_close(&ant, 2); }
+            else if (!strcmp(cmd, "close0")) ant_node_close(&ant, 0);
+            else if (!strcmp(cmd, "hr")) ant_node_open_antplus_slave(&ant, 0, ANTPLUS_DEVTYPE_HRM, 0, ANTPLUS_PERIOD_HRM);
+            else if (!strcmp(cmd, "sync")) { if (arg && strlen(arg) >= 8) { for (int i = 0; i < 4; i++) { char b[3] = {arg[2*i], arg[2*i+1], 0}; ant.phy.sync_override[i] = strtoul(b, 0, 16); } ant.phy.sync_override_on = true; Serial.printf("sync override %02x %02x %02x %02x\n", ant.phy.sync_override[0], ant.phy.sync_override[1], ant.phy.sync_override[2], ant.phy.sync_override[3]); } else { ant.phy.sync_override_on = false; Serial.println("sync override off"); } }
             else if (!strcmp(cmd, "advoff")) NimBLEDevice::getAdvertising()->stop();
             else if (!strcmp(cmd, "ble")) connectBle();
             status();

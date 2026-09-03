@@ -508,7 +508,14 @@ uint32_t ant_mac_tick(ant_mac_t *m, uint32_t now)
                 pri = 2; key = c->next_slot;
             }
         } else {
-            pri = 1; key = (uint32_t)i;
+            /* Searching (or assigned-idle) channels share the radio in turns
+             * of ~250 ms (8192 ticks): the earlier "lowest index wins" rule
+             * let one channel searching for an absent sensor hold the
+             * receiver forever, starving every other search on the node
+             * (seen 2026-09-02: an HR channel waiting for a strap that was
+             * off kept a wildcard scan from ever hearing anything). */
+            uint32_t rot = (now >> 13) % ANT_MAC_MAX_CHANNELS;
+            pri = 1; key = (uint32_t)(((uint32_t)i + ANT_MAC_MAX_CHANNELS - rot) % ANT_MAC_MAX_CHANNELS);
         }
         if (pri > best_pri || (pri == best_pri && pri > 0 && t_gt(best_key, key))) {
             best = i; best_pri = pri; best_key = key;
