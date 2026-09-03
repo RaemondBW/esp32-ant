@@ -81,9 +81,33 @@ extern void  *r_emi_get_mem_addr_by_offset(uint16_t offset);
  * ESPwn32 / esperanto for the C3/S3 scan hooks. */
 #define IPF_LLD_SCAN_PROCESS_PKT_RX 258   /* void (scan_id)            - RX in scan mode    */
 #define IPF_LLD_SCAN_SCHED          268   /* (scan_id, ts, resched)    - scan (re)scheduled */
+/* Window boundaries (same table, ip_funcs.o of the Arduino 2.0.14 / IDF 4.4.6
+ * libbtdm_app.a for the S3): the event-start callback runs after the LL has
+ * programmed the window's CS (channel included), so a patch made there is
+ * what the radio actually uses; the end-of-frame ISR runs when the window is
+ * over, normally or aborted by the arbiter; canceled/skip cover a window that
+ * never ran. Inside a window no other activity touches the radio, so a global
+ * controller bit (CRC checking off) can be flipped for its duration only. */
+#define IPF_LLD_SCAN_EVT_CANCELED   250   /* void (sch_arb_elt *evt) */
+#define IPF_LLD_SCAN_EVT_START      251   /* void (sch_arb_elt *evt)  (_eco) */
+#define IPF_LLD_SCAN_FRM_EOF_ISR    253   /* void (act_id, timestamp, abort) (_eco) */
+#define IPF_LLD_SCAN_FRM_SKIP_ISR   255   /* void (act_id) (_eco) */
+#define IPF_LLD_SCAN_FRM_RX_ISR     254   /* void (act_id) - a packet landed in a window */
 
 #define EM_FREQ_TABLE   0x100u   /* byte[ch] = MHz - 2402 */
-#define EM_CS           0x400u   /* control structure of the scan/test event */
+#define EM_CS           0x400u   /* control structure 0: the test event's */
+/* Control structures are EM_CS_STRIDE apart and one activity each (byte 2 is
+ * the activity index). Which slot the scan gets depends on what else is up:
+ * on a device that advertises and holds connections it was slot 2 (slot 0
+ * unused, slot 1 the phone's slave connection), so coexist mode finds the
+ * scan's CS by its format byte rather than assuming slot 0. */
+#define EM_CS_STRIDE    0x5Au
+#define EM_CS_SLOTS     12u
+#define BLE_CH39_FREQ   2480u    /* what the channel-39 frequency entry means to BLE */
+/* Coexist windows: the host's scan window sets their length (see
+ * CS_MINEVTIME in hook_scan_evt_start). 10 ms windows gave about half of an
+ * ANT+ sensor's 4 Hz page rate on the bench, 25 ms windows the full rate;
+ * connections and advertising are served between windows. */
 #define EM_RX_DESC      0x1000u  /* RX descriptors, 20 bytes each */
 
 #define CS_CNTL                 0    /* event format */
@@ -91,14 +115,23 @@ extern void  *r_emi_get_mem_addr_by_offset(uint16_t offset);
 #define CS_SYNC                 12   /* 4 bytes, bit-swapped, first-on-air last */
 #define CS_HOPCTRL              22
 #define CS_TXDESCPTR            28
+#define CS_MINEVTIME            32   /* scan: the window's programmed length (see below) */
 #define CS_RXMAXBUF             40
 
+#define CS_FORMAT_MASK          0x1F
+#define CS_FORMAT_PASSIVE_SCAN  0x08
+#define CS_FORMAT_ACTIVE_SCAN   0x09
 #define CS_FORMAT_TEST_RX       0x1D
 #define CS_FORMAT_TEST_TX       0x1E
 
 #define RWBLECNTL               (*(volatile uint32_t *)0x60031000u)
 #define RWBLECNTL_CRC_OFF       ((1u << 16) | (1u << 17))
 #define RWBLECNTL_WHIT_OFF      (1u << 18)
+#define RWBLECNTL_SCAN_ABORT    (1u << 26)
+#define RWBLECNTL_ADVERT_ABORT  (1u << 27)
+#define RWBLECNTL_RFTEST_ABORT  (1u << 28)
+
+static inline void IRAM_ATTR coexist_abort(ant_espphy_t *d, uint8_t where);
 
 #define LLD_ENV_RX_FIFO_IDX     0xd8
 #define BLE_CH                  39u
@@ -165,15 +198,72 @@ static inline uint8_t *IRAM_ATTR em_ptr(uint16_t off)
     return (uint8_t *)r_emi_get_mem_addr_by_offset(off);
 }
 
-static void IRAM_ATTR cs_set_frequency(uint16_t mhz)
+/* Channel index the retuned event runs on: fixed 39 for the test event,
+ * configurable in coexist mode (see coexist_ch). */
+static inline uint8_t IRAM_ATTR rx_ch(const ant_espphy_t *d)
 {
-    em_ptr(EM_FREQ_TABLE)[BLE_CH] = (uint8_t)(mhz - 2402u);
+    return (d->coexist && d->coexist_ch) ? d->coexist_ch : (uint8_t)BLE_CH;
+}
+
+static void IRAM_ATTR cs_set_frequency(ant_espphy_t *d, uint16_t mhz)
+{
+    em_ptr(EM_FREQ_TABLE)[rx_ch(d)] = (uint8_t)(mhz - 2402u);
+}
+
+/* The control structure this instance drives: slot 0 for the test event, the
+ * scan's slot (found by coexist_find_cs) in coexist mode. */
+static inline uint8_t *IRAM_ATTR cs_base(const ant_espphy_t *d)
+{
+    return em_ptr(d->cs_off ? d->cs_off : EM_CS);
+}
+
+/* Coexist: locate the scan activity's control structure. A slot whose format
+ * is a passive/active scan is the live one; once patched it reads as our
+ * test-RX format with our sync word, which is also accepted so the search is
+ * stable across windows. The fields we overwrite are saved the first time. */
+static void IRAM_ATTR coexist_find_cs(ant_espphy_t *d)
+{
+    for (unsigned n = 0; n < EM_CS_SLOTS; n++) {
+        uint16_t off = (uint16_t)(EM_CS + n * EM_CS_STRIDE);
+        const uint8_t *cs = em_ptr(off);
+        uint8_t fmt = cs[CS_CNTL] & CS_FORMAT_MASK;
+        if (fmt == CS_FORMAT_PASSIVE_SCAN || fmt == CS_FORMAT_ACTIVE_SCAN) {
+            if (d->cs_off != off) {
+                d->cs_off = off;
+                memcpy(d->cs_saved, cs, sizeof(d->cs_saved));
+                d->cs_have_saved = true;
+            }
+            return;
+        }
+    }
+}
+
+/* Coexist deinit: give the scan its control structure back (format, rate,
+ * sync, hop, rx buffer) and put BLE channel 39 back on its own frequency. */
+static void coexist_restore_cs(ant_espphy_t *d)
+{
+    if (d->cs_have_saved && d->cs_off) {
+        uint8_t *cs = em_ptr(d->cs_off);
+        cs[CS_CNTL]                 = d->cs_saved[CS_CNTL];
+        cs[CS_THRCNTL_RATECNTL]     = d->cs_saved[CS_THRCNTL_RATECNTL];
+        cs[CS_THRCNTL_RATECNTL + 1] = d->cs_saved[CS_THRCNTL_RATECNTL + 1];
+        memcpy(cs + CS_SYNC, d->cs_saved + CS_SYNC, 4);
+        cs[CS_HOPCTRL]              = d->cs_saved[CS_HOPCTRL];
+        cs[CS_HOPCTRL + 1]          = d->cs_saved[CS_HOPCTRL + 1];
+        cs[CS_RXMAXBUF]             = d->cs_saved[CS_RXMAXBUF];
+    }
+    /* The table is linear (entry i = 2402 + 2i MHz), so any entry restores to 2i. */
+    em_ptr(EM_FREQ_TABLE)[rx_ch(d)] = (uint8_t)(2u * rx_ch(d));
+    em_ptr(EM_FREQ_TABLE)[BLE_CH]   = (uint8_t)(BLE_CH39_FREQ - 2402u);
+    d->cs_off = 0;
+    d->cs_have_saved = false;
 }
 
 static void IRAM_ATTR cs_set_sync(ant_espphy_t *d)
 {
-    uint8_t *cs = em_ptr(EM_CS);
-    for (int i = 0; i < 4; i++) cs[CS_SYNC + i] = bit_swap(d->sync[i]);
+    uint8_t *cs = cs_base(d);
+    const uint8_t *sy = d->sync_override_on ? d->sync_override : d->sync;
+    for (int i = 0; i < 4; i++) cs[CS_SYNC + i] = bit_swap(sy[i]);
     memcpy(d->cs_sync, d->sync, 4);
     d->cs_sync_skip = d->sync_skip;
 }
@@ -183,13 +273,35 @@ static void IRAM_ATTR cs_set_sync(ant_espphy_t *d)
  * framing. */
 static void IRAM_ATTR cs_program_rx(ant_espphy_t *d)
 {
-    uint8_t *cs = em_ptr(EM_CS);
+    uint8_t *cs = cs_base(d);
+    /* Coexist keeps the scan's own event format. Writing the receiver-test
+     * format into the scan's slot resets the device by interrupt watchdog
+     * within seconds when other activities (a slave connection to a phone,
+     * advertising) are live - a test event never ends, and the scheduler
+     * spins in its ISR trying to close the window (2026-09-02, T5S3 bike
+     * computer, scan in slot 2). UNRESOLVED: with the scan format kept the
+     * sync/frequency retune takes (BLE advertisements stop arriving), but
+     * every window then yields one descriptor with length 0 and header byte
+     * 0x01/0x0d - the advertising-channel receive path validates the byte
+     * after the sync word as a PDU length, and an ANT device number / type
+     * byte fails that check, so no ANT frame is stored. Needs either a CS
+     * field that lifts the adv length check in scan format, or a way to end
+     * a test-format window cleanly. */
+    /* Both modes run the window as a receiver-test event: it is the only
+     * format whose RX path hands over a frame that fails the BLE CRC / length
+     * rules (an ANT frame always does - the scan formats drop it in hardware,
+     * verified on the S3 2026-09-02). Such an event never ends by itself; in
+     * coexist mode coexist_win_timer_cb pulses SCAN_ABORT after win_len_ms so
+     * the scheduler gets the slot back for connections and advertising. */
     cs[CS_CNTL] = CS_FORMAT_TEST_RX;
-    cs_set_sync(d);
-    cs_set_frequency(d->mhz);
-    cs[CS_HOPCTRL]     = BLE_CH;             /* no hopping, stay on "39" */
-    cs[CS_HOPCTRL + 1] = 0;
-    cs[CS_RXMAXBUF]    = 0xFF;
+    uint8_t pm = (d->coexist && d->patch_mask) ? d->patch_mask : 0xFF;
+    if (pm & 1) cs_set_sync(d);
+    if (pm & 2) {
+        cs_set_frequency(d, d->mhz_override ? d->mhz_override : d->mhz);
+        cs[CS_HOPCTRL]     = rx_ch(d);       /* no hopping, stay on this index */
+        cs[CS_HOPCTRL + 1] = 0;
+    }
+    if (pm & 8) cs[CS_RXMAXBUF] = 0xFF;
     /* Exclusive (test) mode owns the radio, so turn whitening/CRC off in
      * hardware and just bit-swap the bytes. Coexist mode shares the radio with
      * BLE, whose connection events need whitening/CRC on, so it leaves these
@@ -199,9 +311,9 @@ static void IRAM_ATTR cs_program_rx(ant_espphy_t *d)
 
 /* Force 1 Mbit/s in the control structure. The test event already runs at 1M,
  * but a scan event we hijack for coexist mode is re-asserted each window. */
-static void IRAM_ATTR cs_set_rate_1m(void)
+static void IRAM_ATTR cs_set_rate_1m(ant_espphy_t *d)
 {
-    uint8_t *cs = em_ptr(EM_CS);
+    uint8_t *cs = cs_base(d);
     cs[CS_THRCNTL_RATECNTL]     = 0;         /* rate 0 = LE 1M */
     cs[CS_THRCNTL_RATECNTL + 1] = 0x10;
 }
@@ -228,7 +340,7 @@ static uint32_t IRAM_ATTR hook_test_evt_start(uint32_t evt)
         cs_program_rx(d);
         d->sched_hook_calls++;
     } else if (d && d->mode == ANT_ESPPHY_MODE_TX) {
-        cs_set_frequency(d->mhz);
+        cs_set_frequency(d, d->mhz);
         em_ptr(EM_CS)[CS_CNTL] = CS_FORMAT_TEST_TX;
         uint8_t *p = dtm_payload();
         if (p) memset(p, 0, DTM_PAYLOAD_LEN);
@@ -249,6 +361,8 @@ static void IRAM_ATTR decode_rx_desc(ant_espphy_t *d)
         uint8_t idx = ((uint8_t *)p_lld_env)[LLD_ENV_RX_FIFO_IDX];
         uint32_t hdr = desc[idx].header;
         if (hdr != 0) {
+            d->rx_last_hdr = hdr;
+            d->rx_last_stat = desc[idx].unknown_1;
             uint32_t tick = ant_espphy_ticks();
             int8_t  rssi = (int8_t)((hdr >> 16) & 0xff);
             uint8_t size = (uint8_t)((hdr >> 8) & 0xff);
@@ -263,6 +377,26 @@ static void IRAM_ATTR decode_rx_desc(ant_espphy_t *d)
             size_t lead = 4u - d->cs_sync_skip;         /* body bytes taken from the sync */
             size_t need = body_len > lead ? body_len - lead : 0;
             size_t have = 2u + size;
+            if (d->tap_on && have < need && have >= 2 &&
+                d->tap_head - d->tap_tail < ANT_ESPPHY_TAP_RING) {
+                /* Bring-up: a packet the core cut short. Show what it stored,
+                 * decoded the same way, so the length/whitening question can
+                 * be settled from bytes rather than counters. */
+                size_t n = have > ANT_SB_FRAME_MAX - 2 ? ANT_SB_FRAME_MAX - 2 : have;
+                raw[0] = (uint8_t)(hdr & 0xff);
+                raw[1] = size;
+                if (n > 2) memcpy(raw + 2, pdu, n - 2);
+                if (d->coexist) ble_dewhiten(raw, n, rx_ch(d));
+                for (size_t i = 0; i < n; i++) raw[i] = bit_swap(raw[i]);
+                ant_espphy_rx_t *t = &d->tap[d->tap_head % ANT_ESPPHY_TAP_RING];
+                memcpy(t->body, d->cs_sync + d->cs_sync_skip, lead);
+                memcpy(t->body + lead, raw, n);
+                t->len = (uint8_t)(lead + n);
+                t->rssi = rssi;
+                t->tick = tick;
+                t->matched = false;
+                d->tap_head++;
+            }
             if (body_len <= ANT_SB_FRAME_MAX && have >= need && need >= 2) {
                 raw[0] = (uint8_t)(hdr & 0xff);
                 raw[1] = size;
@@ -271,7 +405,7 @@ static void IRAM_ATTR decode_rx_desc(ant_espphy_t *d)
                  * the dewhitening the core applied to this PDU. Test mode ran
                  * with whitening off, so this is skipped there. The whitener
                  * starts at the first PDU byte, which is raw[0]. */
-                if (d->coexist) ble_dewhiten(raw, need, BLE_CH);
+                if (d->coexist) ble_dewhiten(raw, need, rx_ch(d));
                 /* The core stores LSB-first bytes; put them MSB-first. */
                 for (size_t i = 0; i < need; i++) raw[i] = bit_swap(raw[i]);
 
@@ -314,7 +448,7 @@ static void IRAM_ATTR decode_rx_desc(ant_espphy_t *d)
             /* Consumed: make the controller see an empty packet. In coexist
              * mode this also stops the BLE scan from parsing the ANT frame as
              * an advertising report. */
-            desc[idx].header = 0;
+            if (!d->keep_rx_hdr) desc[idx].header = 0;
         } else {
             d->rx_hook_empty++;
         }
@@ -339,11 +473,19 @@ static uint32_t IRAM_ATTR hook_test_rx_isr(uint32_t timestamp)
  * connection events keep running normally between the scan windows. */
 static uint32_t IRAM_ATTR hook_scan_sched(uint32_t scan_id, uint32_t ts, uint32_t resched)
 {
+    coexist_abort(s_dev, 1);
     uint32_t r = s_orig_scan_sched(scan_id, ts, resched);
     ant_espphy_t *d = s_dev;
     if (d && d->coexist && d->mode == ANT_ESPPHY_MODE_RX) {
+        coexist_find_cs(d);         /* the scan's slot, not slot 0 */
+        if (!d->cs_off) return r;
         cs_program_rx(d);           /* format / sync / freq / hop / rxmaxbuf */
-        cs_set_rate_1m();
+        cs_set_rate_1m(d);
+        {
+            uint8_t *cs = cs_base(d);
+            if (d->cs_fmt_override) cs[CS_CNTL] = d->cs_fmt_override;
+            for (unsigned i = 0; i < d->cs_ovr_n && i < 4; i++) cs[d->cs_ovr[i].off] = d->cs_ovr[i].val;
+        }
         d->sched_hook_calls++;
     }
     return r;
@@ -355,6 +497,151 @@ static uint32_t IRAM_ATTR hook_scan_rx(uint32_t scan_id)
     ant_espphy_t *d = s_dev;
     if (d && d->coexist && d->mode == ANT_ESPPHY_MODE_RX) decode_rx_desc(d);
     return s_orig_scan_rx(scan_id);
+}
+
+/* Window start: the LL has just programmed the scan's CS for this window
+ * (its own channel, the BLE access address). Retarget it to ANT and switch
+ * CRC checking off for the window - an ANT frame has no BLE CRC, and in a
+ * scan-class event the core drops CRC failures before the LL (and our RX
+ * hook) ever sees them. The test-event format would deliver them but a
+ * window in that format never ends (interrupt-watchdog reset). */
+static fn_u32_t s_orig_scan_evt_start, s_orig_scan_evt_canceled, s_orig_scan_frm_skip;
+static uint32_t (*s_orig_scan_frm_eof)(uint32_t, uint32_t, uint32_t);
+
+static inline void IRAM_ATTR coexist_abort(ant_espphy_t *d, uint8_t where)
+{
+    if (d && d->coexist && (d->abort_mode & where)) {
+        RWBLECNTL |= (d->abort_mode & 0x20) ? RWBLECNTL_RFTEST_ABORT : RWBLECNTL_SCAN_ABORT;
+        d->aborts++;
+    }
+}
+
+/* Window length from the scan CS's MINEVTIME (312.5 us units; a 16-slot
+ * window reads 25 = 7.8 ms) less a margin for the timer's task-dispatch
+ * jitter. The scheduler REWRITES this for a window already running when a
+ * higher-priority activity (advertising) turns up, so it is re-read on every
+ * timer tick, not just at window start: a deadline taken at start went stale
+ * and the late abort collided with the advertiser (interrupt watchdog). */
+#define ANT_ESPPHY_WIN_US 1000u
+static uint32_t coexist_win_len_us(const ant_espphy_t *d, uint16_t minevt)
+{
+    (void)minevt;
+    /* MINEVTIME-derived deadlines (both 312.5 us and re-read per tick) still
+     * collided with a freshly started advertiser, and so did a fixed 3 ms
+     * window after ~20-60 s of advertising at the default interval: the
+     * collision is probabilistic and scales with how long a window stays
+     * open. 1 ms windows ran a full minute under default advertising and
+     * still delivered ~3.4 pages/s from a 4 Hz sensor (an ANT frame is only
+     * ~150 us on the air), so that is the default; win_len_ms overrides. */
+    if (d->win_len_ms) return (uint32_t)d->win_len_ms * 1000u;
+    return ANT_ESPPHY_WIN_US;
+}
+
+/* Periodic (esp_timer task) watchdog for a window in the test format: such an
+ * event never ends on its own, so once it has run win_len_ms the radio is
+ * told to abort it; the LL then sees a normal end of event, the scheduler
+ * gets the slot back for connections / advertising, and the next window is
+ * retargeted afresh by hook_scan_evt_start. */
+static void coexist_win_timer_cb(void *arg)
+{
+    ant_espphy_t *d = (ant_espphy_t *)arg;
+    if (!d->coexist || !d->win_active || d->mode != ANT_ESPPHY_MODE_RX) return;
+    if (d->cs_off) {
+        const uint8_t *cs = em_ptr(d->cs_off);
+        uint16_t me = (uint16_t)(cs[CS_MINEVTIME] | (cs[CS_MINEVTIME + 1] << 8));
+        if (me != d->win_minevt) { d->win_minevt = me; d->win_len_us = coexist_win_len_us(d, me); }
+    }
+    uint32_t age = (uint32_t)esp_timer_get_time() - d->win_start_us;
+    if (age < d->win_len_us) return;
+    d->win_active = false;
+    /* SCAN_ABORT, not RFTEST_ABORT: the latter ends the event too, but the
+     * LL's end-of-event handling for the scan slot then spins in its ISR
+     * (interrupt watchdog). The scan abort is the path the LL expects. */
+    RWBLECNTL |= (d->abort_mode & 0x20) ? RWBLECNTL_RFTEST_ABORT : RWBLECNTL_SCAN_ABORT;
+    d->aborts++;
+}
+
+static inline void IRAM_ATTR coexist_window_end(ant_espphy_t *d)
+{
+    if (d && d->win_active) {
+        /* Ended by the LL, not by our abort: how long did it let it run? */
+        uint32_t age = (uint32_t)esp_timer_get_time() - d->win_start_us;
+        d->win_ll_ended++;
+        if (!d->win_ll_min_us || age < d->win_ll_min_us) d->win_ll_min_us = age;
+    }
+    if (d) d->win_active = false;
+    if (d && d->coexist && d->win_crc_off) {
+        RWBLECNTL &= ~RWBLECNTL_CRC_OFF;
+        d->win_crc_off = false;
+    }
+}
+
+static uint32_t IRAM_ATTR hook_scan_evt_start(uint32_t evt)
+{
+    uint32_t r = s_orig_scan_evt_start(evt);
+    ant_espphy_t *d = s_dev;
+    if (d && d->coexist && d->mode == ANT_ESPPHY_MODE_RX) {
+        coexist_find_cs(d);
+        if (d->cs_off) {
+            cs_program_rx(d);
+            if (!d->patch_mask || (d->patch_mask & 4)) cs_set_rate_1m(d);
+            uint8_t *cs = cs_base(d);
+            if (d->cs_fmt_override) cs[CS_CNTL] = d->cs_fmt_override;
+            for (unsigned i = 0; i < d->cs_ovr_n && i < 4; i++) cs[d->cs_ovr[i].off] = d->cs_ovr[i].val;
+            if (!d->win_keep_crc) {
+                RWBLECNTL |= RWBLECNTL_CRC_OFF;
+                d->win_crc_off = true;
+            }
+            /* How long this window is allowed to run. A receiver-test event
+             * never ends on its own, and the scheduler places the next
+             * activity (advertising, a connection event) right after the
+             * window's programmed end - abort later than that and the LL
+             * spins in its ISR (interrupt watchdog). So the abort goes a
+             * little BEFORE the window's own length, read from MINEVTIME
+             * (units of 312.5 us on this core: a 16-slot / 10 ms window reads
+             * 25). The 8-ms-good / 20-ms-bad finding of 2026-09-02 fits. */
+            d->win_minevt = (uint16_t)(cs[CS_MINEVTIME] | (cs[CS_MINEVTIME + 1] << 8));
+            d->win_len_us = coexist_win_len_us(d, d->win_minevt);
+            d->win_start_us = (uint32_t)esp_timer_get_time();
+            d->win_active = true;
+            d->win_hook_calls++;
+        }
+    }
+    return r;
+}
+
+static fn_u32_t s_orig_scan_frm_rx;
+static uint32_t IRAM_ATTR hook_scan_frm_rx(uint32_t act_id)
+{
+    ant_espphy_t *d = s_dev;
+    if (d && d->coexist) {
+        d->scan_rx_isr_calls++;
+        em_rx_desc_t *desc = (em_rx_desc_t *)em_ptr(EM_RX_DESC);
+        uint8_t idx = ((uint8_t *)p_lld_env)[LLD_ENV_RX_FIFO_IDX];
+        d->scan_rx_isr_hdr  = desc[idx].header;
+        d->scan_rx_isr_stat = desc[idx].unknown_1;
+    }
+    return s_orig_scan_frm_rx(act_id);
+}
+
+static uint32_t IRAM_ATTR hook_scan_frm_eof(uint32_t act_id, uint32_t ts, uint32_t abort)
+{
+    coexist_abort(s_dev, 2);
+    coexist_window_end(s_dev);
+    return s_orig_scan_frm_eof(act_id, ts, abort);
+}
+
+static uint32_t IRAM_ATTR hook_scan_evt_canceled(uint32_t evt)
+{
+    coexist_abort(s_dev, 4);
+    coexist_window_end(s_dev);
+    return s_orig_scan_evt_canceled(evt);
+}
+
+static uint32_t IRAM_ATTR hook_scan_frm_skip(uint32_t act_id)
+{
+    coexist_window_end(s_dev);
+    return s_orig_scan_frm_skip(act_id);
 }
 
 void ant_espphy_debug_cs(ant_espphy_t *d, uint8_t *out, size_t n)
@@ -376,8 +663,18 @@ static void install_scan_hooks(void)
 {
     s_orig_scan_sched = (fn_scan_sched_t)r_ip_funcs_p[IPF_LLD_SCAN_SCHED];
     s_orig_scan_rx    = (fn_u32_t)r_ip_funcs_p[IPF_LLD_SCAN_PROCESS_PKT_RX];
+    s_orig_scan_evt_start    = (fn_u32_t)r_ip_funcs_p[IPF_LLD_SCAN_EVT_START];
+    s_orig_scan_evt_canceled = (fn_u32_t)r_ip_funcs_p[IPF_LLD_SCAN_EVT_CANCELED];
+    s_orig_scan_frm_skip     = (fn_u32_t)r_ip_funcs_p[IPF_LLD_SCAN_FRM_SKIP_ISR];
+    s_orig_scan_frm_eof      = (uint32_t (*)(uint32_t, uint32_t, uint32_t))r_ip_funcs_p[IPF_LLD_SCAN_FRM_EOF_ISR];
+    s_orig_scan_frm_rx       = (fn_u32_t)r_ip_funcs_p[IPF_LLD_SCAN_FRM_RX_ISR];
+    r_ip_funcs_p[IPF_LLD_SCAN_FRM_RX_ISR]     = (void *)hook_scan_frm_rx;
     r_ip_funcs_p[IPF_LLD_SCAN_SCHED]          = (void *)hook_scan_sched;
     r_ip_funcs_p[IPF_LLD_SCAN_PROCESS_PKT_RX] = (void *)hook_scan_rx;
+    r_ip_funcs_p[IPF_LLD_SCAN_EVT_START]      = (void *)hook_scan_evt_start;
+    r_ip_funcs_p[IPF_LLD_SCAN_EVT_CANCELED]   = (void *)hook_scan_evt_canceled;
+    r_ip_funcs_p[IPF_LLD_SCAN_FRM_SKIP_ISR]   = (void *)hook_scan_frm_skip;
+    r_ip_funcs_p[IPF_LLD_SCAN_FRM_EOF_ISR]    = (void *)hook_scan_frm_eof;
 }
 
 /* ---------------------------------- HCI ----------------------------------- */
@@ -642,6 +939,12 @@ static void restore_scan_hooks(void)
     if (s_orig_scan_rx)    r_ip_funcs_p[IPF_LLD_SCAN_PROCESS_PKT_RX] = (void *)s_orig_scan_rx;
     s_orig_scan_sched = NULL;
     s_orig_scan_rx    = NULL;
+    if (s_orig_scan_evt_start)    r_ip_funcs_p[IPF_LLD_SCAN_EVT_START]    = (void *)s_orig_scan_evt_start;
+    if (s_orig_scan_evt_canceled) r_ip_funcs_p[IPF_LLD_SCAN_EVT_CANCELED] = (void *)s_orig_scan_evt_canceled;
+    if (s_orig_scan_frm_skip)     r_ip_funcs_p[IPF_LLD_SCAN_FRM_SKIP_ISR] = (void *)s_orig_scan_frm_skip;
+    if (s_orig_scan_frm_eof)      r_ip_funcs_p[IPF_LLD_SCAN_FRM_EOF_ISR]  = (void *)s_orig_scan_frm_eof;
+    if (s_orig_scan_frm_rx)       r_ip_funcs_p[IPF_LLD_SCAN_FRM_RX_ISR]   = (void *)s_orig_scan_frm_rx;
+    RWBLECNTL &= ~RWBLECNTL_CRC_OFF;
 }
 
 ant_espphy_status_t ant_espphy_init(ant_espphy_t *dev)
@@ -738,6 +1041,11 @@ ant_espphy_status_t ant_espphy_init_coexist(ant_espphy_t *dev)
      * have not checked. */
     uintptr_t f0 = (uintptr_t)r_ip_funcs_p[IPF_LLD_SCAN_SCHED];
     uintptr_t f1 = (uintptr_t)r_ip_funcs_p[IPF_LLD_SCAN_PROCESS_PKT_RX];
+    if (!is_code_ptr((uintptr_t)r_ip_funcs_p[IPF_LLD_SCAN_EVT_START]) ||
+        !is_code_ptr((uintptr_t)r_ip_funcs_p[IPF_LLD_SCAN_EVT_CANCELED]) ||
+        !is_code_ptr((uintptr_t)r_ip_funcs_p[IPF_LLD_SCAN_FRM_SKIP_ISR]) ||
+        !is_code_ptr((uintptr_t)r_ip_funcs_p[IPF_LLD_SCAN_FRM_EOF_ISR]))
+        f0 = 0;
     if (!is_code_ptr(f0) || !is_code_ptr(f1)) {
         ESP_LOGE(TAG, "unexpected controller function table (%p %p); refusing to hook",
                  (void *)f0, (void *)f1);
@@ -746,6 +1054,15 @@ ant_espphy_status_t ant_espphy_init_coexist(ant_espphy_t *dev)
 
     s_dev = dev;
     install_scan_hooks();
+    {
+        esp_timer_create_args_t a = { .callback = coexist_win_timer_cb, .arg = dev,
+                                      .dispatch_method = ESP_TIMER_TASK, .name = "antwin" };
+        esp_timer_handle_t t = NULL;
+        if (esp_timer_create(&a, &t) == ESP_OK && esp_timer_start_periodic(t, 1000) == ESP_OK)
+            dev->win_timer = t;
+        else
+            ESP_LOGW(TAG, "window timer unavailable");
+    }
     ESP_LOGI(TAG, "BLE scan path hooked for ANT coexist: sched %p rx %p",
              (void *)hook_scan_sched, (void *)hook_scan_rx);
     return ANT_ESPPHY_OK;
@@ -756,7 +1073,22 @@ void ant_espphy_deinit(ant_espphy_t *dev)
     if (!dev) return;
     if (dev->coexist) {
         dev->mode = ANT_ESPPHY_MODE_IDLE;
+        /* A window in the test format that is running right now would never
+         * end once the timer is gone, and the host's next scan stop would
+         * wait on it forever: end it first. */
+        if (dev->win_active) {
+            dev->win_active = false;
+            RWBLECNTL |= RWBLECNTL_SCAN_ABORT;
+            dev->aborts++;
+            vTaskDelay(pdMS_TO_TICKS(5));
+        }
+        if (dev->win_timer) {
+            esp_timer_stop((esp_timer_handle_t)dev->win_timer);
+            esp_timer_delete((esp_timer_handle_t)dev->win_timer);
+            dev->win_timer = NULL;
+        }
         if (s_dev == dev) { restore_scan_hooks(); s_dev = NULL; }
+        coexist_restore_cs(dev);
         ESP_LOGI(TAG, "scan path released (controller stays with the BLE host)");
         return;
     }

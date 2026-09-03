@@ -84,6 +84,29 @@ same time on one radio.
 For the bike computer this is the better fit than the hand-off: keep the phone
 BLE link up and read the ANT+ sensors on the same radio, with no deinit dance.
 
+What the 2026-09-02 bench established (T5S3 bike computer + an S3 devkit, a
+Magene strap, device 26945):
+
+- The controller keeps one control structure (CS) per activity, 90 bytes
+  apart from EM offset 0x400; the scan lands in whichever slot is free (slot 2
+  on a device that also advertises and holds a connection). The backend finds
+  the scan's slot by its format byte instead of assuming slot 0.
+- Only the receiver-test event format delivers ANT frames; every scan-class
+  format drops them in hardware. A test-format window never ends on its own,
+  and a window that outlives its slot stalls the controller's ISR (interrupt
+  watchdog reset) as soon as another activity is due. The backend therefore
+  ends each window itself by pulsing `RWBLECNTL.SCAN_ABORT` from a 1 ms
+  `esp_timer`, `ANT_ESPPHY_WIN_US` (1 ms) after the window starts.
+- **Start the ANT node before the BLE scan.** The controller calls the scan's
+  window-start callback through a pointer captured when the scan is created;
+  the window hooks are only installed once `ant_node_start()` has run.
+- A 1 ms window still yields ~3.4 pages/s from a 4 Hz sensor (an ANT frame
+  is ~150 us on the air). Longer windows raise the odds of the remaining
+  problem: a higher-priority event (advertising, a connection event) that
+  starts while a window is open still resets the device. See the comment on
+  `coexist_win_len_us()` in `ant_espphy.c`; `examples/bench_antonly/`
+  reproduces all of this on a bare devkit with console knobs.
+
 `ant_node_stop()` waits for the ANT task to exit (≤ 500 ms), so call it from
 a normal task, not from the ANT callbacks.
 

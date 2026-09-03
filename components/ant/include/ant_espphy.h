@@ -99,6 +99,50 @@ typedef struct {
     bool     coexist;                 /* shared-radio mode: a BLE host owns the
                                          controller, ANT rides its passive scan */
     uint16_t mhz;
+    /* coexist: EM offset of the scan activity's control structure (0 = not
+     * found yet), and the fields we overwrite in it, kept for deinit. */
+    uint16_t cs_off;
+    uint8_t  cs_saved[48];
+    bool     cs_have_saved;
+    /* coexist bring-up knobs, applied to the scan CS at every (re)schedule
+     * after the normal retune: a format byte to force (0 = keep the scan's),
+     * and up to four raw byte overrides. */
+    uint8_t  coexist_ch;              /* channel index the retuned windows run on
+                                         (0 = 39). It is also the whitening seed the
+                                         core applies, so it decides how the byte after
+                                         the sync word reads as a packet length. */
+    uint8_t  cs_fmt_override;
+    struct { uint8_t off, val; } cs_ovr[4];
+    uint8_t  cs_ovr_n;
+    bool     win_crc_off;             /* CRC checking is off for the current window */
+    bool     win_keep_crc;            /* knob: leave CRC checking on (experiment) */
+    uint32_t win_hook_calls;          /* scan windows retargeted at start */
+    uint8_t  abort_mode;              /* knob (default 0 = timer + SCAN_ABORT): 1/2/4 also
+                                         pulse in the reschedule hook / end-of-frame ISR
+                                         / canceled callback; 0x20 = RFTEST_ABORT instead */
+    uint32_t aborts;                  /* abort pulses issued */
+    uint16_t win_len_ms;              /* window length override, ms (0 = derive it from
+                                         the scan's own MINEVTIME each window) */
+    uint16_t win_minevt;              /* MINEVTIME read from the scan CS at window start */
+    uint32_t win_len_us;              /* length in use for the current window */
+    uint32_t win_ll_ended;            /* windows the LL ended before our abort */
+    uint32_t win_ll_min_us;           /* ... the shortest such window (0 = none yet) */
+    volatile uint32_t win_start_us;   /* esp_timer time of the current window's start */
+    volatile bool     win_active;
+    void    *win_timer;               /* periodic esp_timer driving the abort */
+    uint16_t mhz_override;            /* knob: window frequency instead of the MAC's (0 = off) */
+    uint8_t  sync_override[4];        /* knob: on-air sync bytes to program instead of
+                                         the MAC's (sync_override_on) */
+    bool     sync_override_on;
+    bool     keep_rx_hdr;             /* knob: do not zero consumed RX descriptor headers */
+    uint8_t  patch_mask;              /* knob: which CS patches to apply at window
+                                         start (0 = all): 1 sync, 2 freq+hop, 4 rate,
+                                         8 rxmaxbuf */
+    uint32_t scan_rx_isr_calls;       /* scan RX ISR entries (a packet in a window) */
+    uint32_t scan_rx_isr_hdr;         /* ... last descriptor header word seen there */
+    uint32_t scan_rx_isr_stat;        /* ... and its cntl|stat word */
+    uint32_t rx_last_hdr;             /* last non-empty RX descriptor header word */
+    uint32_t rx_last_stat;            /* ... and the word before it (cntl|stat) */
 
     /* receiver programming */
     ant_phy_rx_cfg_t rx_cfg;
