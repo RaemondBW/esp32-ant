@@ -76,6 +76,12 @@ extern void  *r_emi_get_mem_addr_by_offset(uint16_t offset);
 #define IPF_LLD_TEST_EVT_START_CBK  127   /* void (sch_arb_elt *evt)   - event programmed */
 #define IPF_LLD_TEST_RX_ISR         132   /* void (timestamp)          - RX interrupt      */
 
+/* Scan-path indices, for the coexist (shared-radio) mode. Same table, verified
+ * against ip_funcs.o in the ESP-IDF v5.4 libbtdm_app.a for the S3; used by
+ * ESPwn32 / esperanto for the C3/S3 scan hooks. */
+#define IPF_LLD_SCAN_PROCESS_PKT_RX 258   /* void (scan_id)            - RX in scan mode    */
+#define IPF_LLD_SCAN_SCHED          268   /* (scan_id, ts, resched)    - scan (re)scheduled */
+
 #define EM_FREQ_TABLE   0x100u   /* byte[ch] = MHz - 2402 */
 #define EM_CS           0x400u   /* control structure of the scan/test event */
 #define EM_RX_DESC      0x1000u  /* RX descriptors, 20 bytes each */
@@ -116,10 +122,13 @@ typedef struct {
 } em_tx_desc_t;
 
 typedef uint32_t (*fn_u32_t)(uint32_t arg);
+typedef uint32_t (*fn_scan_sched_t)(uint32_t scan_id, uint32_t ts, uint32_t resched);
 
-static fn_u32_t      s_orig_evt_start;
-static fn_u32_t      s_orig_rx_isr;
-static ant_espphy_t *s_dev;            /* the single instance the hooks serve */
+static fn_u32_t         s_orig_evt_start;
+static fn_u32_t         s_orig_rx_isr;
+static fn_scan_sched_t  s_orig_scan_sched;
+static fn_u32_t         s_orig_scan_rx;
+static ant_espphy_t    *s_dev;         /* the single instance the hooks serve */
 
 /* ------------------------------ bit helpers ------------------------------- */
 
@@ -129,6 +138,24 @@ static inline uint8_t IRAM_ATTR bit_swap(uint8_t v)
     v = (uint8_t)((v & 0xCC) >> 2 | (v & 0x33) << 2);
     v = (uint8_t)((v & 0xAA) >> 1 | (v & 0x55) << 1);
     return v;
+}
+
+/* BLE data-whitening LFSR (x^7 + x^4 + 1) keyed by channel index, over bytes as
+ * the core stores them (LSB-first). XOR is self-inverse, so this undoes the
+ * hardware dewhitening the controller applies to a received PDU. Used only in
+ * coexist mode, where we leave hardware whitening on (so BLE keeps working) and
+ * recover the never-whitened ANT payload in software. From ESPwn32/esperanto. */
+static void IRAM_ATTR ble_dewhiten(uint8_t *data, size_t len, uint8_t channel)
+{
+    uint8_t lfsr = (uint8_t)(bit_swap(channel) | 2);
+    for (size_t i = 0; i < len; i++) {
+        uint8_t c = bit_swap(data[i]);
+        for (int j = 7; j >= 0; j--) {
+            if (lfsr & 0x80) { lfsr ^= 0x11; c ^= (uint8_t)(1u << j); }
+            lfsr <<= 1;
+        }
+        data[i] = bit_swap(c);
+    }
 }
 
 /* ------------------------------- CS patching ------------------------------ */
@@ -163,7 +190,20 @@ static void IRAM_ATTR cs_program_rx(ant_espphy_t *d)
     cs[CS_HOPCTRL]     = BLE_CH;             /* no hopping, stay on "39" */
     cs[CS_HOPCTRL + 1] = 0;
     cs[CS_RXMAXBUF]    = 0xFF;
-    RWBLECNTL |= RWBLECNTL_CRC_OFF | RWBLECNTL_WHIT_OFF;
+    /* Exclusive (test) mode owns the radio, so turn whitening/CRC off in
+     * hardware and just bit-swap the bytes. Coexist mode shares the radio with
+     * BLE, whose connection events need whitening/CRC on, so it leaves these
+     * global bits alone and undoes the whitening in software (see decode). */
+    if (!d->coexist) RWBLECNTL |= RWBLECNTL_CRC_OFF | RWBLECNTL_WHIT_OFF;
+}
+
+/* Force 1 Mbit/s in the control structure. The test event already runs at 1M,
+ * but a scan event we hijack for coexist mode is re-asserted each window. */
+static void IRAM_ATTR cs_set_rate_1m(void)
+{
+    uint8_t *cs = em_ptr(EM_CS);
+    cs[CS_THRCNTL_RATECNTL]     = 0;         /* rate 0 = LE 1M */
+    cs[CS_THRCNTL_RATECNTL + 1] = 0x10;
 }
 
 static uint8_t *IRAM_ATTR dtm_payload(void)
@@ -197,13 +237,14 @@ static uint32_t IRAM_ATTR hook_test_evt_start(uint32_t evt)
     return r;
 }
 
-/* Receiver-test RX interrupt: the descriptor at the FIFO index holds a packet
- * whose sync word matched. Pull the raw bytes, rebuild the ANT body, queue it,
- * then let the controller count and free the descriptor as usual. */
-static uint32_t IRAM_ATTR hook_test_rx_isr(uint32_t timestamp)
+/* Pull one received packet out of the RX descriptor at the current FIFO index,
+ * rebuild the ANT body from the sync word + raw bytes, run the software address
+ * match, and queue matches for rx_poll(). Shared by the receiver-test RX
+ * interrupt (test mode) and the scan RX callback (coexist mode). Runs in the
+ * controller's interrupt context: IRAM, no logging, no blocking. */
+static void IRAM_ATTR decode_rx_desc(ant_espphy_t *d)
 {
-    ant_espphy_t *d = s_dev;
-    if (d && d->mode == ANT_ESPPHY_MODE_RX) {
+    {
         em_rx_desc_t *desc = (em_rx_desc_t *)em_ptr(EM_RX_DESC);
         uint8_t idx = ((uint8_t *)p_lld_env)[LLD_ENV_RX_FIFO_IDX];
         uint32_t hdr = desc[idx].header;
@@ -226,7 +267,12 @@ static uint32_t IRAM_ATTR hook_test_rx_isr(uint32_t timestamp)
                 raw[0] = (uint8_t)(hdr & 0xff);
                 raw[1] = size;
                 memcpy(raw + 2, pdu, need - 2);
-                /* DTM runs with whitening off; the core stores LSB-first bytes */
+                /* Coexist mode leaves hardware whitening on (for BLE), so undo
+                 * the dewhitening the core applied to this PDU. Test mode ran
+                 * with whitening off, so this is skipped there. The whitener
+                 * starts at the first PDU byte, which is raw[0]. */
+                if (d->coexist) ble_dewhiten(raw, need, BLE_CH);
+                /* The core stores LSB-first bytes; put them MSB-first. */
                 for (size_t i = 0; i < need; i++) raw[i] = bit_swap(raw[i]);
 
                 uint8_t body[ANT_SB_FRAME_MAX];
@@ -265,13 +311,50 @@ static uint32_t IRAM_ATTR hook_test_rx_isr(uint32_t timestamp)
                     }
                 }
             }
-            /* Consumed: make the controller see an empty packet. */
+            /* Consumed: make the controller see an empty packet. In coexist
+             * mode this also stops the BLE scan from parsing the ANT frame as
+             * an advertising report. */
             desc[idx].header = 0;
         } else {
             d->rx_hook_empty++;
         }
     }
+}
+
+/* Receiver-test RX interrupt (test mode): decode, then let the controller count
+ * and free the descriptor as usual. */
+static uint32_t IRAM_ATTR hook_test_rx_isr(uint32_t timestamp)
+{
+    ant_espphy_t *d = s_dev;
+    if (d && !d->coexist && d->mode == ANT_ESPPHY_MODE_RX) decode_rx_desc(d);
     return s_orig_rx_isr(timestamp);
+}
+
+/* -------------------------- coexist (scan) hooks -------------------------- */
+
+/* The scan activity has been (re)scheduled: retarget its control structure to
+ * ANT (2457 MHz / 1 Mbit/s / ANT sync word). The CS persists between windows,
+ * so this need not fire every window; whitening/CRC stay on in hardware and the
+ * PDU is de-whitened in software (see decode_rx_desc), which is what lets BLE
+ * connection events keep running normally between the scan windows. */
+static uint32_t IRAM_ATTR hook_scan_sched(uint32_t scan_id, uint32_t ts, uint32_t resched)
+{
+    uint32_t r = s_orig_scan_sched(scan_id, ts, resched);
+    ant_espphy_t *d = s_dev;
+    if (d && d->coexist && d->mode == ANT_ESPPHY_MODE_RX) {
+        cs_program_rx(d);           /* format / sync / freq / hop / rxmaxbuf */
+        cs_set_rate_1m();
+        d->sched_hook_calls++;
+    }
+    return r;
+}
+
+/* Scan RX callback: a packet matched the (ANT) sync word during the window. */
+static uint32_t IRAM_ATTR hook_scan_rx(uint32_t scan_id)
+{
+    ant_espphy_t *d = s_dev;
+    if (d && d->coexist && d->mode == ANT_ESPPHY_MODE_RX) decode_rx_desc(d);
+    return s_orig_scan_rx(scan_id);
 }
 
 void ant_espphy_debug_cs(ant_espphy_t *d, uint8_t *out, size_t n)
@@ -287,6 +370,14 @@ static void install_hooks(void)
     s_orig_rx_isr    = (fn_u32_t)r_ip_funcs_p[IPF_LLD_TEST_RX_ISR];
     r_ip_funcs_p[IPF_LLD_TEST_EVT_START_CBK] = (void *)hook_test_evt_start;
     r_ip_funcs_p[IPF_LLD_TEST_RX_ISR]        = (void *)hook_test_rx_isr;
+}
+
+static void install_scan_hooks(void)
+{
+    s_orig_scan_sched = (fn_scan_sched_t)r_ip_funcs_p[IPF_LLD_SCAN_SCHED];
+    s_orig_scan_rx    = (fn_u32_t)r_ip_funcs_p[IPF_LLD_SCAN_PROCESS_PKT_RX];
+    r_ip_funcs_p[IPF_LLD_SCAN_SCHED]          = (void *)hook_scan_sched;
+    r_ip_funcs_p[IPF_LLD_SCAN_PROCESS_PKT_RX] = (void *)hook_scan_rx;
 }
 
 /* ---------------------------------- HCI ----------------------------------- */
@@ -411,6 +502,7 @@ static bool espphy_tx(ant_phy_t *p, const uint8_t *frame, size_t len)
     memcpy(d->last_frame, frame, len);
     d->last_len = (uint8_t)len;
 
+    if (d->coexist)                    { d->tx_refused++; return false; } /* RX-only mode */
     if (d->mode == ANT_ESPPHY_MODE_RX) { d->tx_refused++; return false; }
     if (d->mode != ANT_ESPPHY_MODE_TX && !enter_mode(d, ANT_ESPPHY_MODE_TX)) return false;
 
@@ -452,6 +544,9 @@ static void espphy_rx_config(ant_phy_t *p, const ant_phy_rx_cfg_t *cfg)
     if (memcmp(d->sync, sync, 4) == 0 && d->sync_skip == skip) return;
     memcpy(d->sync, sync, 4);
     d->sync_skip = skip;
+    /* Coexist mode reprograms the CS at every scan window, so a new sync word
+     * takes effect on its own; nothing to restart. */
+    if (d->coexist) return;
     if (d->mode != ANT_ESPPHY_MODE_RX) return;
 
     /* The running event keeps its sync word. That is fine as long as it can
@@ -489,6 +584,13 @@ static void espphy_rx_enable(ant_phy_t *p, bool on)
 {
     ant_espphy_t *d = (ant_espphy_t *)p;
     d->rx_on = on;
+    if (d->coexist) {
+        /* No HCI: the scan windows the BLE host runs are the radio. Once armed
+         * we keep grabbing them (the MAC toggles rx off between slots; the scan
+         * windows are shared and cheap, so stay listening like the test path). */
+        if (on) d->mode = ANT_ESPPHY_MODE_RX;
+        return;
+    }
     if (!on) return;                                /* stay in RX; cheap and keeps timing */
     if (d->mode == ANT_ESPPHY_MODE_TX) { d->rx_enables_ignored++; return; }
     if (d->mode != ANT_ESPPHY_MODE_RX) enter_mode(d, ANT_ESPPHY_MODE_RX);
@@ -513,12 +615,33 @@ static size_t espphy_rx_poll(ant_phy_t *p, uint8_t *body, size_t cap, uint32_t *
 
 /* --------------------------------- public --------------------------------- */
 
+static void espphy_setup_phy(ant_espphy_t *dev);
+
+/* A plausible S3/C3 code pointer: masked ROM, IRAM, or flash-.text (icache).
+ * The controller installs IRAM "hack"/"eco" patches over some link-layer
+ * entries at runtime (coexistence, ROM bug fixes), so a table entry being in
+ * IRAM rather than ROM is expected, not a red flag. */
+static bool is_code_ptr(uintptr_t p)
+{
+    return (p >= 0x40000000u && p < 0x40060000u) ||   /* masked ROM              */
+           (p >= 0x40370000u && p < 0x403E0000u) ||   /* IRAM (runtime patches)  */
+           (p >= 0x42000000u && p < 0x43000000u);     /* flash .text via icache  */
+}
+
 static void restore_hooks(void)
 {
     if (s_orig_evt_start) r_ip_funcs_p[IPF_LLD_TEST_EVT_START_CBK] = (void *)s_orig_evt_start;
     if (s_orig_rx_isr)    r_ip_funcs_p[IPF_LLD_TEST_RX_ISR]        = (void *)s_orig_rx_isr;
     s_orig_evt_start = NULL;
     s_orig_rx_isr    = NULL;
+}
+
+static void restore_scan_hooks(void)
+{
+    if (s_orig_scan_sched) r_ip_funcs_p[IPF_LLD_SCAN_SCHED]          = (void *)s_orig_scan_sched;
+    if (s_orig_scan_rx)    r_ip_funcs_p[IPF_LLD_SCAN_PROCESS_PKT_RX] = (void *)s_orig_scan_rx;
+    s_orig_scan_sched = NULL;
+    s_orig_scan_rx    = NULL;
 }
 
 ant_espphy_status_t ant_espphy_init(ant_espphy_t *dev)
@@ -533,15 +656,7 @@ ant_espphy_status_t ant_espphy_init(ant_espphy_t *dev)
         return ANT_ESPPHY_ERR_BT;
     }
     memset(dev, 0, sizeof(*dev));
-    dev->phy.tune      = espphy_tune;
-    dev->phy.tx        = espphy_tx;
-    dev->phy.rx_config = espphy_rx_config;
-    dev->phy.rx_enable = espphy_rx_enable;
-    dev->phy.rx_poll   = espphy_rx_poll;
-    dev->phy.ctx       = dev;
-    dev->mhz           = 2457;
-    dev->sync[0] = 0xAA; dev->sync[1] = 0xAA; dev->sync[2] = 0xA6; dev->sync[3] = 0xC5;
-    dev->sync_skip = 2;
+    espphy_setup_phy(dev);
 
     s_hci_done = xSemaphoreCreateBinary();
     const esp_timer_create_args_t targs = { .callback = tx_clear_cb, .arg = dev, .name = "ant_txclr" };
@@ -588,9 +703,63 @@ ant_espphy_status_t ant_espphy_init(ant_espphy_t *dev)
     return ANT_ESPPHY_OK;
 }
 
+/* Fill in the ant_phy_t vtable and the ANT defaults shared by both init paths. */
+static void espphy_setup_phy(ant_espphy_t *dev)
+{
+    dev->phy.tune      = espphy_tune;
+    dev->phy.tx        = espphy_tx;
+    dev->phy.rx_config = espphy_rx_config;
+    dev->phy.rx_enable = espphy_rx_enable;
+    dev->phy.rx_poll   = espphy_rx_poll;
+    dev->phy.ctx       = dev;
+    dev->mhz           = 2457;
+    dev->sync[0] = 0xAA; dev->sync[1] = 0xAA; dev->sync[2] = 0xA6; dev->sync[3] = 0xC5;
+    dev->sync_skip = 2;
+}
+
+ant_espphy_status_t ant_espphy_init_coexist(ant_espphy_t *dev)
+{
+    if (!dev) return ANT_ESPPHY_ERR_ARG;
+    if (s_dev) return ANT_ESPPHY_ERR_ARG;           /* one instance only */
+    if (esp_bt_controller_get_status() != ESP_BT_CONTROLLER_STATUS_ENABLED) {
+        /* Coexist rides a BLE host's radio; that host must already be up and
+         * running a scan. If nothing owns the controller, use ant_espphy_init()
+         * (exclusive mode) instead. */
+        ESP_LOGE(TAG, "coexist needs a running BLE host (controller not ENABLED)");
+        return ANT_ESPPHY_ERR_BT;
+    }
+    memset(dev, 0, sizeof(*dev));
+    espphy_setup_phy(dev);
+    dev->coexist = true;
+    dev->bt_up   = false;                           /* the host owns the controller */
+
+    /* The three scan entries must be ROM functions, as everywhere else this
+     * table has been verified (IDF 4.4.6 / 5.4). Anything else is a layout we
+     * have not checked. */
+    uintptr_t f0 = (uintptr_t)r_ip_funcs_p[IPF_LLD_SCAN_SCHED];
+    uintptr_t f1 = (uintptr_t)r_ip_funcs_p[IPF_LLD_SCAN_PROCESS_PKT_RX];
+    if (!is_code_ptr(f0) || !is_code_ptr(f1)) {
+        ESP_LOGE(TAG, "unexpected controller function table (%p %p); refusing to hook",
+                 (void *)f0, (void *)f1);
+        return ANT_ESPPHY_ERR_UNSUPPORTED;
+    }
+
+    s_dev = dev;
+    install_scan_hooks();
+    ESP_LOGI(TAG, "BLE scan path hooked for ANT coexist: sched %p rx %p",
+             (void *)hook_scan_sched, (void *)hook_scan_rx);
+    return ANT_ESPPHY_OK;
+}
+
 void ant_espphy_deinit(ant_espphy_t *dev)
 {
     if (!dev) return;
+    if (dev->coexist) {
+        dev->mode = ANT_ESPPHY_MODE_IDLE;
+        if (s_dev == dev) { restore_scan_hooks(); s_dev = NULL; }
+        ESP_LOGI(TAG, "scan path released (controller stays with the BLE host)");
+        return;
+    }
     if (dev->bt_up && dev->mode != ANT_ESPPHY_MODE_IDLE) enter_mode(dev, ANT_ESPPHY_MODE_IDLE);
     if (s_dev == dev) {
         restore_hooks();
@@ -651,6 +820,13 @@ ant_espphy_status_t ant_espphy_init(ant_espphy_t *dev)
     dev->phy.rx_poll   = stub_rx_poll;
     dev->phy.ctx       = dev;
     dev->mhz           = 2457;
+    ESP_LOGE(TAG, "no ANT radio backend for " CONFIG_IDF_TARGET " yet (S3/C3 only)");
+    return ANT_ESPPHY_ERR_UNSUPPORTED;
+}
+
+ant_espphy_status_t ant_espphy_init_coexist(ant_espphy_t *dev)
+{
+    if (dev) { memset(dev, 0, sizeof(*dev)); }
     ESP_LOGE(TAG, "no ANT radio backend for " CONFIG_IDF_TARGET " yet (S3/C3 only)");
     return ANT_ESPPHY_ERR_UNSUPPORTED;
 }

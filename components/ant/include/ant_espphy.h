@@ -37,9 +37,20 @@
  * A bidirectional master therefore transmits but never hears replies; the ANT
  * MAC copes (broadcasts do not need one).
  *
- * The controller is used bare (no BLE host, our own VHCI callback), so a BLE
- * host cannot be up at the same time: init() refuses unless the controller is
- * idle, deinit() shuts it down again for the host.
+ * In the default (exclusive) mode the controller is used bare (no BLE host,
+ * our own VHCI callback), so a BLE host cannot be up at the same time: init()
+ * refuses unless the controller is idle, deinit() shuts it down again for the
+ * host.
+ *
+ * There is also a coexist (shared-radio) mode - ant_espphy_init_coexist() -
+ * that runs ANT receive *alongside* a live BLE host (NimBLE/Bluedroid) instead
+ * of taking the controller. It hooks the controller's scan path rather than
+ * test mode: while an ANT receive is open, the BLE host's passive-scan radio
+ * windows are retuned to ANT, frames are lifted out, and the never-whitened
+ * ANT payload is de-whitened in software - so no global radio register is
+ * changed and BLE connection events between the scan windows keep working.
+ * The scan windows are consumed by ANT (so BLE scanning pauses while an ANT
+ * receive is open), and this mode is receive-only. See that function.
  *
  * Supported: ESP32-S3, ESP32-C3 (same controller; the function-table indices
  * are identical on ESP-IDF 4.4 and 5.x, so the Arduino core works too).
@@ -84,7 +95,9 @@ typedef struct {
 typedef struct {
     ant_phy_t phy;                    /* must be first */
     volatile ant_espphy_mode_t mode;
-    bool     bt_up;
+    bool     bt_up;                   /* this driver brought the controller up */
+    bool     coexist;                 /* shared-radio mode: a BLE host owns the
+                                         controller, ANT rides its passive scan */
     uint16_t mhz;
 
     /* receiver programming */
@@ -129,6 +142,22 @@ typedef struct {
 /* Bring up the BT controller, install the hooks, leave the radio idle. Only
  * one instance can exist (the hooks are global). */
 ant_espphy_status_t ant_espphy_init(ant_espphy_t *dev);
+
+/* Shared-radio variant: coexist with a running BLE host (NimBLE/Bluedroid)
+ * instead of taking the controller. The BLE host must already be initialised
+ * AND running a passive scan (that scan's radio windows are what ANT rides
+ * on); the controller stays owned by the host. This installs hooks on the
+ * *scan* path (r_lld_scan_sched / r_lld_scan_process_pkt_rx): while an ANT
+ * receive is open, each scan window is retuned to 2457 MHz / 1 Mbit/s / the
+ * ANT sync word with CRC and whitening disabled, ANT frames are lifted out of
+ * the RX descriptor, and the controls are restored at the end of the window so
+ * BLE connection events in between run normally. RX only - tx() is refused in
+ * this mode (the scan activity has no transmit slot). Because the scan windows
+ * are consumed by ANT, real BLE scanning does not run while an ANT receive is
+ * open; BLE connections are unaffected. Returns ANT_ESPPHY_ERR_BT if no BLE
+ * host has the controller enabled. Call ant_espphy_deinit() to remove the
+ * hooks; it leaves the controller with the host. */
+ant_espphy_status_t ant_espphy_init_coexist(ant_espphy_t *dev);
 
 /* Diagnostics: with dev->tap_on set, every packet the RX hook decodes (address
  * matched or not) is copied into a side ring; this pops the oldest one. The

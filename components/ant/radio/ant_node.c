@@ -142,7 +142,8 @@ ant_espphy_status_t ant_node_start(ant_node_t *n, const ant_node_config_t *cfg)
     n->lock = xSemaphoreCreateRecursiveMutex();
     if (!n->lock) return ANT_ESPPHY_ERR_ARG;
 
-    ant_espphy_status_t s = ant_espphy_init(&n->phy);
+    ant_espphy_status_t s = n->cfg.coexist ? ant_espphy_init_coexist(&n->phy)
+                                           : ant_espphy_init(&n->phy);
     if (s != ANT_ESPPHY_OK) {
         ESP_LOGE(TAG, "radio: %s", ant_espphy_status_str(s));
         vSemaphoreDelete((SemaphoreHandle_t)n->lock);

@@ -100,6 +100,48 @@ HCI traffic, so the backend is sticky per start: slave channels receive, a
 master channel transmits, and a master never hears replies (the MAC copes;
 broadcasts do not need any).
 
+## Receiving it *while BLE is running* (coexist mode)
+
+The mode above takes the whole controller. `ant_espphy_init_coexist()` instead
+runs ANT receive **alongside a live BLE host** (NimBLE / Bluedroid). The host
+keeps the controller; ANT rides its passive scan. Two different link-layer
+functions are hooked — the scan path, not test mode: index 268
+`r_lld_scan_sched` (retarget the scan's control structure to 2457 MHz / 1 Mbit
+/ the ANT sync word, once — the CS persists between windows) and 258
+`r_lld_scan_process_pkt_rx` (lift the frame out of the RX descriptor, exactly
+as the test-mode RX interrupt does, then zero the descriptor header so the BLE
+scan does not also parse it as an advertisement).
+
+The important difference from test mode is **whitening**. Test mode turns
+whitening and CRC off in the global `RWBLECNTL` register, which is fine when we
+own the radio but would corrupt BLE connection events if left set. Coexist mode
+therefore **touches no global register**: it leaves hardware whitening on (so
+BLE stays correct) and undoes it in software. ANT's access address (sync word)
+is not whitened, so the hardware still matches it and delivers the packet; only
+the PDU comes out dewhitened with the channel-39 sequence. Re-applying that same
+sequence (XOR is self-inverse) recovers the original ANT bytes before the usual
+bit-reversal. Bad CRC does not drop the packet on this path, and the MAC checks
+the ANT CRC-16 itself.
+
+Consequences, by design:
+
+- **BLE connections keep working** — connection events run between the scan
+  windows and see a normal radio (nothing global was changed).
+- **BLE scanning pauses** while an ANT receive is open, because the scan
+  windows are consumed by ANT. Discover and connect BLE peers first, then open
+  the ANT receive.
+- **Receive only.** The scan activity has no transmit slot, so `tx()` is
+  refused in this mode.
+
+On the bench this tracks the worn strap through the full stack (66–75 bpm,
+RSSI −51…−56, essentially every slot matched) with NimBLE initialised and
+scanning on the same ESP32-S3 radio at the same time — see
+`examples/platformio_ble_coexist`. The controller's own runtime patches matter
+here: the S3 installs IRAM "hack"/"eco" replacements over some scan entries for
+Wi-Fi/BT coexistence, so those table slots point into IRAM rather than ROM; the
+coexist init chains onto whatever is there rather than insisting on a ROM
+address.
+
 ## Using it
 
 ```c

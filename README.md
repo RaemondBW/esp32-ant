@@ -48,11 +48,17 @@ lets several slave channels (HRM + power + cadence) share the one receiver.
 
 Two consequences of the mechanism:
 
-- **The radio is exclusive.** The controller runs bare, with our own VHCI
-  callback and no BLE host. A BLE host (NimBLE, Bluedroid) must be stopped
-  before `ant_node_start()`, and `ant_node_stop()` releases the controller for
-  it again. `ant_node_start()` refuses (`ANT_ESPPHY_ERR_BT`) if a host still
-  owns the controller.
+- **The radio is exclusive — or shared.** By default the controller runs bare,
+  with our own VHCI callback and no BLE host: a BLE host (NimBLE, Bluedroid)
+  must be stopped before `ant_node_start()`, and `ant_node_stop()` releases the
+  controller for it again (`ant_node_start()` refuses with `ANT_ESPPHY_ERR_BT`
+  if a host still owns it). There is also a **coexist mode** (`cfg.coexist =
+  true`, `ant_espphy_init_coexist()`) that receives ANT *alongside* a running
+  BLE host by hooking the controller's scan path and de-whitening the ANT
+  payload in software — no global radio state is touched, so BLE connections
+  keep working; BLE scanning pauses while an ANT receive is open, and coexist
+  is receive-only. Verified on the S3 with NimBLE scanning and an ANT+ strap
+  tracking at the same time.
 - **One direction per start.** Switching between the receiver and transmitter
   test costs milliseconds of HCI traffic, so the backend is sticky: a node with
   slave channels receives, a node with a master channel transmits. A master
@@ -131,7 +137,11 @@ computer's toolchain) with `~/.platformio/penv/bin/pio run`:
 - [`examples/platformio_ble_handoff/`](examples/platformio_ble_handoff/) —
   NimBLE-Arduino and the ANT stack in one binary, alternating ownership of the
   radio (`NimBLEDevice::deinit(true)` → `ant_node_start()` … `ant_node_stop()`
-  → `NimBLEDevice::init()`). This is the shape of the bike-computer
+  → `NimBLEDevice::init()`).
+- [`examples/platformio_ble_coexist/`](examples/platformio_ble_coexist/) —
+  NimBLE and ANT+ **live at the same time** on one radio: NimBLE stays up and
+  scanning (and can hold BLE connections) while ANT+ receives the strap via
+  `cfg.coexist = true`. This is the better shape for the bike-computer
   integration; see [`docs/PLATFORMIO.md`](docs/PLATFORMIO.md).
 
 ### ESP-IDF
@@ -271,7 +281,7 @@ components/ant/
   radio/        ant_espphy (ESP32-S3/C3 BLE core as ant_phy_t), ant_node
                 (radio + engine + task), ant_radio_loopback (simulated chip
                 for the legacy serial-stack tests)
-examples/       PlatformIO/Arduino projects (HRM display/sensor, BLE handoff)
+examples/       PlatformIO/Arduino projects (HRM display/sensor, BLE handoff, BLE coexist)
 main/           ESP-IDF firmware (self-test, then HRM display or sensor)
 test/host/      zero-dependency unit tests (cc + make)
 tools/antcap/   HackRF bench tooling (decoder, frame synthesiser, tone locator; make check)

@@ -30,12 +30,15 @@ the ANT task stack is 4 KB (configurable), plus the BT controller's own
 internal-RAM allocation while the radio is up — the same ~50 KB NimBLE's
 controller half already costs, and it is only ever one or the other.
 
-## The one rule: the radio is exclusive
+## The radio: exclusive by default, or shared with BLE
 
-The ANT backend drives the BLE controller bare (its own VHCI callback, LE test
-mode, hooked link-layer functions). No BLE host can be up at the same time,
-and the controller cannot serve BLE and ANT alternately within a session —
-it is one or the other until you switch.
+There are two ways to run ANT next to BLE.
+
+### 1. Exclusive (hand-off): ANT owns the radio
+
+The default ANT backend drives the BLE controller bare (its own VHCI callback,
+LE test mode, hooked link-layer functions). No BLE host can be up at the same
+time; you hand the controller back and forth.
 
 ```cpp
 NimBLEDevice::deinit(true);          // NimBLE: stop host, disable + deinit controller
@@ -52,6 +55,34 @@ than corrupting the controller. `NimBLEDevice::deinit()` in NimBLE-Arduino
 verified in its source (`nimble_port.c`), so no extra `btStop()` is needed.
 `examples/platformio_ble_handoff/` links both stacks and alternates every
 20 s; it builds against the bike computer's platform pin.
+
+### 2. Coexist (shared radio): ANT receives while BLE stays up
+
+Set `cfg.coexist = true` and ANT does **not** take the controller. NimBLE keeps
+it and keeps running; ANT rides NimBLE's passive-scan radio windows. The BLE
+host must already be up and scanning:
+
+```cpp
+NimBLEDevice::init("name");                    // BLE host up first
+NimBLEScan *scan = NimBLEDevice::getScan();
+scan->setActiveScan(false);
+scan->start(0, false, true);                   // perpetual passive scan = ANT's radio windows
+ant_node_config_t cfg = {};
+cfg.on_data = on_page;
+cfg.coexist = true;                            // share the radio
+ant_node_start(&node, &cfg);                   // returns ANT_ESPPHY_ERR_BT if no host is up
+ant_node_open_antplus_slave(&node, 0, ANTPLUS_DEVTYPE_HRM, 0, ANTPLUS_PERIOD_HRM);
+```
+
+The trade-offs (see `docs/SHOCKBURST_LINK.md` and `ant_espphy_init_coexist()`):
+BLE **connections** keep working (ANT changes no global radio state), but BLE
+**scanning** pauses while an ANT receive is open (the scan windows are consumed
+by ANT — discover/connect BLE peers first), and coexist mode is **receive
+only**. `examples/platformio_ble_coexist/` shows NimBLE and ANT+ live at the
+same time on one radio.
+
+For the bike computer this is the better fit than the hand-off: keep the phone
+BLE link up and read the ANT+ sensors on the same radio, with no deinit dance.
 
 `ant_node_stop()` waits for the ANT task to exit (≤ 500 ms), so call it from
 a normal task, not from the ANT callbacks.
@@ -134,15 +165,27 @@ Pages decode with the profile helpers in `antplus_profiles.h`
 ## Fitting it into the bike computer
 
 The bike computer today pairs BLE sensors by saved MAC (`ble_sensors`) and
-serves the phone over BLE (`ble_server`, `ams_client`), all on NimBLE. ANT+ is
-therefore a **mode**, not an addition:
+serves the phone over BLE (`ble_server`, `ams_client`), all on NimBLE. ANT+ can
+join two ways:
 
-1. **Sensor source setting**: `BLE` (current) or `ANT+`. In ANT+ mode the
-   phone link is unavailable while sensors are live — that is a physical
-   constraint of one radio, so the UI should say so rather than pretend.
+- **Coexist (recommended):** keep NimBLE up (phone link, BLE sensors) and add
+  ANT+ receive on the same radio with `cfg.coexist = true` and a passive scan
+  running (§ "Coexist" above). No deinit dance; the phone link stays connected.
+  BLE *scanning* pauses while ANT is receiving, so pair/connect BLE sensors
+  first — but existing connections, including the phone, keep running.
+- **Exclusive (hand-off):** ANT+ as a **mode** that owns the radio; the phone
+  link is down while ANT sensors are live.
+
+For the exclusive mode:
+
+1. **Sensor source setting**: `BLE` (current) or `ANT+`. In exclusive ANT+ mode
+   the phone link is unavailable while sensors are live — a physical constraint
+   of one radio, so the UI should say so rather than pretend. (Coexist mode
+   avoids this.)
 2. **`ant_sensors` module** mirroring `ble_sensors`: `begin()` does
    `NimBLEDevice::deinit(true)` (if `ble_sensors`/`ble_server` are up) then
-   `ant_node_start()` and opens one slave channel per kind (HR / power /
+   `ant_node_start()` — or, for coexist, leaves NimBLE up and passes
+   `cfg.coexist = true` — and opens one slave channel per kind (HR / power /
    speed-cadence). `on_data` decodes with `antplus_*_decode` and publishes
    into the same sensor-state structs the BLE path feeds, so the dashboard,
    FIT writer and ride recorder do not care which radio delivered a reading.

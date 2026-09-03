@@ -102,6 +102,13 @@ typedef struct {
     uint8_t              task_priority;/* 0 = configMAX_PRIORITIES - 2 (it must win) */
     uint8_t              task_core;   /* 0 = default (core 1 on dual-core parts; the BT
                                          controller lives on core 0), or ANT_NODE_CORE_* */
+    bool                 coexist;     /* shared-radio mode: a BLE host (NimBLE/Bluedroid)
+                                         already owns the controller and is running a
+                                         passive scan; ANT receives on that scan's radio
+                                         windows instead of taking the controller. RX only
+                                         (no ANT transmit). The host must be up and
+                                         scanning before ant_node_start(). See
+                                         ant_espphy_init_coexist(). */
 } ant_node_config_t;
 
 #define ANT_NODE_CORE_0    0x80u
