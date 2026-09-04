@@ -287,3 +287,7 @@ test/host/      zero-dependency unit tests (cc + make)
 tools/antcap/   HackRF bench tooling (decoder, frame synthesiser, tone locator; make check)
 docs/           PLATFORMIO (integration), SHOCKBURST_LINK, PHY_FINDINGS, TIER3_MODEM_RE
 ```
+
+## License
+
+Apache License 2.0 — see [`LICENSE`](LICENSE).

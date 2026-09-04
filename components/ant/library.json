@@ -3,6 +3,7 @@
   "version": "0.1.0",
   "description": "Pure-ESP32 ANT / ANT+ stack: the ESP32-S3/C3 BLE core driven as a raw ANT modem plus a complete ANT protocol engine (channels, search, broadcast, acknowledged, burst, ANT+ profiles). No external radio chip.",
   "keywords": "ant, ant+, antplus, heart rate, hrm, bike, esp32, esp32-s3, esp32-c3, radio",
+  "license": "Apache-2.0",
   "authors": [
     { "name": "Raemond", "maintainer": true }
   ],
